@@ -1,0 +1,46 @@
+*.py[cod]
+
+# Temp files
+*~
+~*
+.*~
+\#*
+.#*
+*#
+dist
+
+# Build files
+build
+dist
+pkg
+*.egg
+*.egg-info
+
+# Debian Files
+debian/files
+debian/python-github-backup*
+
+# Sphinx build
+doc/_build
+
+# Generated man page
+doc/github_backup.1
+
+# Annoying macOS files
+.DS_Store
+._*
+
+# IDE configuration files
+.vscode
+.atom
+.idea
+
+README
+
+# RSA
+id_rsa
+id_rsa.pub
+
+# Virtual env
+venv
+.venv

@@ -1,0 +1,75 @@
+# Docker ignore file to reduce build context size
+
+# Temp files
+*~
+~*
+.*~
+\#*
+.#*
+*#
+dist
+
+# Build files
+build
+dist
+pkg
+*.egg
+*.egg-info
+
+# Debian Files
+debian/files
+debian/python-github-backup*
+
+# Sphinx build
+doc/_build
+
+# Generated man page
+doc/github_backup.1
+
+# Annoying macOS files
+.DS_Store
+._*
+
+# IDE configuration files
+.vscode
+.atom
+.idea
+*.code-workspace
+
+# RSA
+id_rsa
+id_rsa.pub
+
+# Virtual env
+venv
+.venv
+
+# Git
+.git
+.gitignore
+.gitchangelog.rc
+.github
+
+# Documentation
+*.md
+!README.md
+
+# Environment variables files
+.env
+.env.*
+!.env.example
+*.log
+
+# Cache files
+**/__pycache__/
+*.py[cod]
+
+# Docker files
+docker-compose.yml
+Dockerfile*
+
+# Other files
+release
+*.tar
+*.zip
+*.gzip
