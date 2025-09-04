@@ -1,23 +1,24 @@
-FROM python:3.12-alpine3.22 AS builder
+FROM python:3.13-alpine3.22 AS builder
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir uv
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=requirements.txt,target=requirements.txt \
-    --mount=type=bind,source=release-requirements.txt,target=release-requirements.txt \
-    uv venv \
-    && uv pip install -r release-requirements.txt
+# Copy dependency files first for better caching
+COPY pyproject.toml uv.lock ./
 
+# Create virtual environment and install dependencies
+RUN --mount=type=cache,target=/root/.cache/uv uv venv
+
+# Copy source code
 COPY . .
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install .
+# Install the package in development mode to include all files
+RUN --mount=type=cache,target=/root/.cache/uv uv pip install .
 
 
-FROM python:3.12-alpine3.22
+FROM python:3.13-alpine3.22
 ENV PYTHONUNBUFFERED=1
 
 RUN apk add --no-cache \
@@ -27,9 +28,10 @@ RUN apk add --no-cache \
     && addgroup -g 1000 appuser \
     && adduser -D -u 1000 -G appuser appuser
 
-COPY --from=builder --chown=appuser:appuser /app /app
+# Copy the virtual environment from builder
+COPY --from=builder /app/.venv /app/.venv
 
-WORKDIR /app
+WORKDIR /data
 
 USER appuser
 

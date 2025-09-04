@@ -9,6 +9,9 @@
 *#
 dist
 
+__pycache__
+*.pyc
+
 # Build files
 build
 dist
@@ -44,3 +47,7 @@ id_rsa.pub
 # Virtual env
 venv
 .venv
+
+# test content
+/creds
+/backup

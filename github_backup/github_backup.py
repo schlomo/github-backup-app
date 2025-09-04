@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from __future__ import print_function
+
 
 import argparse
 import base64
@@ -47,9 +47,10 @@ FILE_URI_PREFIX = "file://"
 logger = logging.getLogger(__name__)
 
 # Global variables for GitHub App token management
-_github_app_token = None
-_github_app_token_expires = None
+_github_app_tokens = {}  # Cache tokens per installation: {installation_id: (token, expires_at)}
 _github_app_credentials = None
+_token_refresh_failures = {}  # Track consecutive token refresh failures per installation
+_token_refresh_failure_times = {}  # Track when failures occurred for backoff
 
 https_ctx = ssl.create_default_context()
 if not https_ctx.get_ca_certs():
@@ -97,7 +98,7 @@ def logging_subprocess(
                 continue
             if not (io == child.stderr and not line):
                 # Decode bytes to string for proper logging
-                line_str = line.decode('utf-8', errors='replace').rstrip('\n')
+                line_str = line.decode("utf-8", errors="replace").rstrip("\n")
                 # Only log non-empty lines to avoid cluttering the output
                 if line_str.strip():
                     logger.log(log_level[io], line_str)
@@ -140,12 +141,12 @@ def mask_password(url, secret="*****"):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(description="Backup a github account")
+    parser = argparse.ArgumentParser(description="Backup GitHub repositories and metadata using GitHub App authentication")
     parser.add_argument(
-        "user", 
-        metavar="USER", 
-        nargs="*", 
-        help="github username(s) or organization(s) to backup (optional - if not provided, will backup all discovered installations)"
+        "users",
+        metavar="USER",
+        nargs="*",
+        help="GitHub username(s) or organization(s) to backup (optional - if not provided, will backup all discovered installations)",
     )
     parser.add_argument(
         "-q",
@@ -160,11 +161,7 @@ def parse_args(args=None):
         dest="app_id",
         help="GitHub App ID for app authentication",
     )
-    parser.add_argument(
-        "--installation-id",
-        dest="installation_id",
-        help="GitHub App Installation ID for app authentication (optional - if not provided, will auto-discover all installations)",
-    )
+
     parser.add_argument(
         "--private-key",
         dest="private_key",
@@ -189,16 +186,8 @@ def parse_args(args=None):
         "--incremental",
         action="store_true",
         dest="incremental",
-        help="incremental backup",
+        help="incremental backup using files to match last version",
     )
-    parser.add_argument(
-        "--incremental-by-files",
-        action="store_true",
-        dest="incremental_by_files",
-        help="incremental backup based on modification date of files",
-    )
-
-
 
     parser.add_argument(
         "--all",
@@ -295,7 +284,6 @@ def parse_args(args=None):
         help="include wiki clone in backup",
     )
 
-
     parser.add_argument(
         "--skip-existing",
         action="store_true",
@@ -318,13 +306,7 @@ def parse_args(args=None):
     parser.add_argument(
         "-H", "--github-host", dest="github_host", help="GitHub Enterprise hostname"
     )
-    parser.add_argument(
-        "-O",
-        "--organization",
-        action="store_true",
-        dest="organization",
-        help="whether or not this is an organization user",
-    )
+
     parser.add_argument(
         "-R",
         "--repository",
@@ -332,11 +314,7 @@ def parse_args(args=None):
         help="name of repository to limit backup to",
     )
 
-    parser.add_argument(
-        "--prefer-ssh",
-        action="store_true",
-        help="Clone repositories using SSH instead of HTTPS",
-    )
+
     parser.add_argument(
         "-v", "--version", action="version", version="%(prog)s " + VERSION
     )
@@ -384,8 +362,6 @@ def parse_args(args=None):
         "--exclude", dest="exclude", help="names of repositories to exclude", nargs="*"
     )
 
-
-
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -407,46 +383,53 @@ def validate_args(args):
             "GitHub App authentication is required. Please provide --app-id and --private-key.\n"
             "Create a GitHub App at https://github.com/settings/apps/new and install it on your account/organization."
         )
-    
-    # Validate installation_id vs auto-discovery logic
-    if args.installation_id and not args.user:
-        raise Exception(
-            "When using --installation-id, you must specify at least one USER to backup.\n"
-            "Auto-discovery mode (backing up all installations) is only available when --installation-id is not provided."
-        )
 
 
-def get_auth(args, encode=True, for_git_cli=False, installation_id=None):
-    """Get authentication for GitHub App. Installation ID must be provided."""
+
+
+def get_auth(args, installation_id, encode=True, for_git_cli=False):
+    """Get authentication for GitHub App for a specific installation."""
     global _github_app_credentials
+
+    if not installation_id:
+        raise Exception("Installation ID is required for authentication.")
     
-    # Use provided installation_id or fall back to args.installation_id
-    target_installation_id = installation_id or args.installation_id
-    
-    if not target_installation_id:
-        raise Exception("Installation ID is required for authentication. Use auto-discovery mode or provide --installation-id.")
-    
+    logger.debug(f"get_auth called with installation_id={installation_id}")
+
     # Store credentials globally for token refresh (only if not already set)
     if not _github_app_credentials:
-        _github_app_credentials = (args.app_id, target_installation_id, args.private_key)
-    
-    # Get fresh token
-    token = get_or_refresh_github_app_token()
+        _github_app_credentials = (
+            args.app_id,
+            installation_id,  # Use the first installation_id for credentials
+            args.private_key,
+        )
+
+    # Get fresh token for this specific installation
+    github_host = get_github_api_host(args)
+    token = get_or_refresh_github_app_token(installation_id, github_host)
     if not token:
         raise Exception("Failed to generate GitHub App installation token")
     
+    # Log token details for debugging
+    logger.debug(f"Using token: {token[:10]}...{token[-10:]} (length: {len(token)})")
+    if not token.startswith('ghs_'):
+        raise Exception(f"Token doesn't start with 'ghs_': {token[:20]}...")
+    
+    # Log successful token usage
+    logger.debug(f"Successfully obtained valid token for installation {installation_id}")
+
     if not for_git_cli:
         auth = token
     else:
         auth = "x-access-token:" + token
-        
+
     # For GitHub App tokens, we don't need to encode
     if not encode or not for_git_cli:
         return auth
     return base64.b64encode(auth.encode("ascii"))
 
 
-def generate_github_app_token(app_id, installation_id, private_key):
+def generate_github_app_token(app_id, installation_id, private_key, github_host="api.github.com"):
     """Generate an installation access token for GitHub App authentication."""
     try:
         # Load private key
@@ -456,73 +439,175 @@ def generate_github_app_token(app_id, installation_id, private_key):
             # If it's a file path, convert to file:// format
             file_uri = f"{FILE_URI_PREFIX}{private_key}"
             private_key = read_file_contents(file_uri)
-        
+
         # Create JWT payload
         now = int(time.time())
         payload = {
             "iat": now - 60,  # Issued at (1 minute ago to account for clock skew)
             "exp": now + 600,  # Expires in 10 minutes (max allowed)
-            "iss": int(app_id)  # Issuer (GitHub App ID)
+            "iss": int(app_id),  # Issuer (GitHub App ID)
         }
         # Generate JWT
         jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
-        
+
         # Request installation access token
-        url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+        url = (
+            f"https://{github_host}/app/installations/{installation_id}/access_tokens"
+        )
         headers = {
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": f"github-backup/{VERSION}"
+            "User-Agent": f"github-backup/{VERSION}",
         }
-        
+
         request = Request(url, headers=headers, method="POST")
         request.data = b""  # Empty POST body
-        
+
         response = urlopen(request, context=https_ctx)
         data = json.loads(response.read().decode("utf-8"))
-        
+
         token = data["token"]
         expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+
+        logger.info(
+            f"Generated GitHub App installation token for installation {installation_id} (expires at {expires_at})"
+        )
+        logger.debug(f"Token starts with: {token[:10]}...")
         
-        logger.info(f"Generated GitHub App installation token (expires at {expires_at})")
+        # Validate the token
+        logger.debug(f"Validating generated token for installation {installation_id}")
+        if not validate_github_app_token(token, github_host):
+            raise Exception("Generated token failed validation")
+        
+        logger.info(f"Token validation successful for installation {installation_id}")
         return token, expires_at
-        
+
     except Exception as e:
         raise Exception(f"Failed to generate GitHub App token: {str(e)}")
 
 
-def get_or_refresh_github_app_token():
-    """Get current GitHub App token or refresh it if expired/missing."""
-    global _github_app_token, _github_app_token_expires, _github_app_credentials
+def _is_token_refresh_circuit_open(installation_id):
+    """Check if the circuit breaker is open for token refresh failures."""
+    global _token_refresh_failures, _token_refresh_failure_times
     
+    failures = _token_refresh_failures.get(installation_id, 0)
+    if failures < 3:  # Allow up to 3 consecutive failures
+        return False
+    
+    # Check if enough time has passed since last failure (exponential backoff)
+    last_failure_time = _token_refresh_failure_times.get(installation_id)
+    if not last_failure_time:
+        return False
+    
+    # Exponential backoff: 2^failures minutes, max 30 minutes
+    backoff_minutes = min(2 ** failures, 30)
+    backoff_duration = timedelta(minutes=backoff_minutes)
+    
+    if datetime.utcnow() - last_failure_time < backoff_duration:
+        logger.warning(f"Circuit breaker open for installation {installation_id}. "
+                      f"Failed {failures} times, waiting {backoff_minutes} minutes before retry.")
+        return True
+    
+    return False
+
+
+def _record_token_refresh_success(installation_id):
+    """Record a successful token refresh, resetting failure counters."""
+    global _token_refresh_failures, _token_refresh_failure_times
+    _token_refresh_failures[installation_id] = 0
+    _token_refresh_failure_times.pop(installation_id, None)
+
+
+def _record_token_refresh_failure(installation_id):
+    """Record a token refresh failure, incrementing failure counters."""
+    global _token_refresh_failures, _token_refresh_failure_times
+    _token_refresh_failures[installation_id] = _token_refresh_failures.get(installation_id, 0) + 1
+    _token_refresh_failure_times[installation_id] = datetime.utcnow()
+
+
+def get_or_refresh_github_app_token(installation_id, github_host="api.github.com"):
+    """Get current GitHub App token or refresh it if expired/missing for a specific installation."""
+    global _github_app_tokens, _github_app_credentials
+
     if not _github_app_credentials:
         return None
-        
-    app_id, installation_id, private_key = _github_app_credentials
-    
+
+    app_id, _, private_key = _github_app_credentials
+
+    # Check circuit breaker first
+    if _is_token_refresh_circuit_open(installation_id):
+        raise Exception(f"Token refresh circuit breaker is open for installation {installation_id}. "
+                       "Too many consecutive failures. Please check your GitHub App credentials and network connectivity.")
+
+    # Check if we have a cached token for this installation
+    cached_token, cached_expires = _github_app_tokens.get(installation_id, (None, None))
+
     # Simple approach: Check if token exists and is not expired (with 5-minute buffer)
     # Convert both times to UTC for comparison (GitHub API returns UTC times)
     now_utc = datetime.utcnow()
-    expires_utc = _github_app_token_expires.replace(tzinfo=None) if _github_app_token_expires else None
-    
+    expires_utc = (
+        cached_expires.replace(tzinfo=None)
+        if cached_expires
+        else None
+    )
+
     # Generate new token if:
-    # 1. No token exists
+    # 1. No token exists for this installation
     # 2. Token is expired or will expire within 5 minutes
-    if (_github_app_token is None or 
-        expires_utc is None or 
-        now_utc >= (expires_utc - timedelta(minutes=5))):
+    if (
+        cached_token is None
+        or expires_utc is None
+        or now_utc >= (expires_utc - timedelta(minutes=5))
+    ):
+        logger.info(f"Generating new GitHub App token for installation {installation_id}...")
+        logger.debug(f"Token generation conditions: token_exists={cached_token is not None}, expires_utc={expires_utc}, now_utc={now_utc}")
         
-        logger.info("Generating new GitHub App token...")
-        _github_app_token, _github_app_token_expires = generate_github_app_token(
-            app_id, installation_id, private_key
-        )
+        try:
+            new_token, new_expires = generate_github_app_token(
+                app_id, installation_id, private_key, github_host
+            )
+            # Cache the token for this installation
+            _github_app_tokens[installation_id] = (new_token, new_expires)
+            _record_token_refresh_success(installation_id)
+            return new_token
+        except Exception as e:
+            _record_token_refresh_failure(installation_id)
+            logger.error(f"Failed to generate token for installation {installation_id}: {str(e)}")
+            raise
     else:
-        logger.debug(f"Using cached token, expires at: {_github_app_token_expires}")
-    
-    return _github_app_token
+        logger.debug(f"Using cached token for installation {installation_id}, expires at: {cached_expires}")
+        return cached_token
 
 
-def discover_github_app_installations(app_id, private_key, github_host="api.github.com"):
+def validate_github_app_token(token, github_host="api.github.com"):
+    """Validate a GitHub App installation token by making a test API call."""
+    try:
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": f"github-backup/{VERSION}",
+        }
+        
+        # Test with rate limit endpoint
+        request = Request(f"https://{github_host}/rate_limit", headers=headers)
+        response = urlopen(request, context=https_ctx)
+        
+        if response.getcode() == 200:
+            data = json.loads(response.read().decode("utf-8"))
+            logger.debug(f"Token validation successful. Rate limit: {data.get('rate', {}).get('remaining', 'unknown')} remaining")
+            return True
+        else:
+            logger.error(f"Token validation failed with status code: {response.getcode()}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Token validation failed: {str(e)}")
+        return False
+
+
+def discover_github_app_installations(
+    app_id, private_key, github_host="api.github.com"
+):
     """Discover all installations of a GitHub App."""
     try:
         # Load private key
@@ -531,40 +616,42 @@ def discover_github_app_installations(app_id, private_key, github_host="api.gith
         elif os.path.exists(private_key):
             file_uri = f"{FILE_URI_PREFIX}{private_key}"
             private_key = read_file_contents(file_uri)
-        
+
         # Create JWT payload
         now = int(time.time())
         payload = {
             "iat": now - 60,  # Issued at (1 minute ago to account for clock skew)
             "exp": now + 600,  # Expires in 10 minutes (max allowed)
-            "iss": int(app_id)  # Issuer (GitHub App ID)
+            "iss": int(app_id),  # Issuer (GitHub App ID)
         }
-        
+
         # Generate JWT
         jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
-        
+
         # Request installations list
         url = f"https://{github_host}/app/installations"
         headers = {
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": f"github-backup/{VERSION}"
+            "User-Agent": f"github-backup/{VERSION}",
         }
-        
+
         request = Request(url, headers=headers)
         response = urlopen(request, context=https_ctx)
         installations = json.loads(response.read().decode("utf-8"))
-        
+
         logger.info(f"Discovered {len(installations)} GitHub App installations")
         for installation in installations:
             account = installation.get("account", {})
             account_type = account.get("type", "unknown")
             account_login = account.get("login", "unknown")
             installation_id = installation.get("id", "unknown")
-            logger.info(f"  - {account_type}: {account_login} (installation ID: {installation_id})")
-        
+            logger.info(
+                f"  - {account_type}: {account_login} (installation ID: {installation_id})"
+            )
+
         return installations
-        
+
     except Exception as e:
         raise Exception(f"Failed to discover GitHub App installations: {str(e)}")
 
@@ -592,37 +679,29 @@ def read_file_contents(file_uri):
 
 
 def get_github_repo_url(args, repository):
-    if args.prefer_ssh:
-        return repository["ssh_url"]
-
-    # Use installation context if available (from discovery phase)
+    """Generate HTTPS clone URL for a repository using GitHub App authentication."""
+    # Get installation context (required for multi-installation mode)
     installation_id = repository.get("_installation_id")
-    if installation_id:
-        # Use the enhanced get_auth function with installation_id
-        auth = get_auth(args, encode=False, for_git_cli=True, installation_id=installation_id)
-        repo_url = "https://{0}@{1}/{2}/{3}.git".format(
-            auth,
-            get_github_host(args),
-            repository["owner"]["login"],
-            repository["name"],
-        )
-    else:
-        # Fallback to original method
-        auth = get_auth(args, encode=False, for_git_cli=True)
-        if auth:
-            repo_url = "https://{0}@{1}/{2}/{3}.git".format(
-                auth,
-                get_github_host(args),
-                repository["owner"]["login"],
-                repository["name"],
-            )
-        else:
-            repo_url = repository["clone_url"]
-
+    if not installation_id:
+        raise Exception(f"Repository {repository.get('full_name', 'unknown')} missing installation context")
+    
+    # Get authentication for this installation
+    auth = get_auth(args, installation_id, encode=False, for_git_cli=True)
+    
+    # Build HTTPS clone URL with authentication
+    repo_url = "https://{0}@{1}/{2}/{3}.git".format(
+        auth,
+        get_github_host(args),
+        repository["owner"]["login"],
+        repository["name"],
+    )
+    
     return repo_url
 
 
-def retrieve_data_gen(args, template, query_args=None, single_request=False, installation_id=None):
+def retrieve_data_gen(
+    args, template, installation_id, query_args=None, single_request=False
+):
     query_args = get_query_args(query_args)
     per_page = 100
     page = 0
@@ -633,10 +712,11 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
         else:
             page = page + 1
             request_page, request_per_page = page, per_page
-        
-        # Always get fresh auth before each API call - caching handles optimization
-        auth = get_auth(args, encode=False, installation_id=installation_id)
-        
+
+        # Always get fresh auth before each API call - this handles token refresh automatically
+        auth = get_auth(args, installation_id, encode=False)
+        logger.debug(f"Using installation token for installation {installation_id} for API request to {template}")
+
         request = _construct_request(
             request_per_page,
             request_page,
@@ -673,6 +753,13 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
                     limit_remaining, args.throttle_pause
                 )
             )
+            
+            # Clear cached tokens during throttling to prevent expiration during pause
+            if _github_app_credentials is not None:
+                logger.info("Throttling active, clearing cached tokens to prevent expiration during pause")
+                global _github_app_tokens
+                _github_app_tokens.clear()
+            
             time.sleep(args.throttle_pause)
 
         retries = 0
@@ -680,6 +767,10 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
             logger.warning("API request failed. Retrying in 5 seconds")
             retries += 1
             time.sleep(5)
+            
+            # Get fresh auth for retry - this will automatically handle token refresh if needed
+            auth = get_auth(args, installation_id, encode=False)
+            
             request = _construct_request(
                 per_page,
                 page,
@@ -706,8 +797,30 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
                 read_error = True
 
         if status_code != 200:
-            template = "API request returned HTTP {0}: {1}"
-            errors.append(template.format(status_code, r.reason))
+            # Try to get more detailed error information from GitHub API response
+            error_details = ""
+            required_permissions = ""
+            try:
+                if hasattr(r, 'read'):
+                    response_body = r.read().decode("utf-8")
+                    if response_body:
+                        error_data = json.loads(response_body)
+                        if "message" in error_data:
+                            error_details = f" - {error_data['message']}"
+                        if "documentation_url" in error_data:
+                            error_details += f" (See: {error_data['documentation_url']})"
+                        
+                        # Check for required permissions header
+                        if hasattr(r, 'headers'):
+                            required_perms = r.headers.get('X-Accepted-GitHub-Permissions', '')
+                            if required_perms:
+                                required_permissions = f" Required permissions: {required_perms}"
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                # If we can't parse the error response, just use the basic info
+                pass
+            
+            template = "API request returned HTTP {0}: {1}{2}{3}"
+            errors.append(template.format(status_code, r.reason, error_details, required_permissions))
             raise Exception(", ".join(errors))
 
         if read_error:
@@ -724,14 +837,16 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
                     break
             elif type(response) is dict:
                 # Handle special case for /installation/repositories endpoint
-                if 'repositories' in response and 'total_count' in response:
-                    repos_list = response['repositories']
-                    total_count = response['total_count']
-                    repository_selection = response.get('repository_selection', 'unknown')
-                    
+                if "repositories" in response and "total_count" in response:
+                    repos_list = response["repositories"]
+                    total_count = response["total_count"]
+                    repository_selection = response.get(
+                        "repository_selection", "unknown"
+                    )
+
                     for resp in repos_list:
                         yield resp
-                    
+
                     # For installation/repositories, stop if we got fewer repos than requested
                     if len(repos_list) < per_page:
                         break
@@ -745,8 +860,12 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False, ins
             break
 
 
-def retrieve_data(args, template, query_args=None, single_request=False, installation_id=None):
-    return list(retrieve_data_gen(args, template, query_args, single_request, installation_id))
+def retrieve_data(
+    args, template, installation_id, query_args=None, single_request=False
+):
+    return list(
+        retrieve_data_gen(args, template, installation_id, query_args, single_request)
+    )
 
 
 def get_query_args(query_args=None):
@@ -758,15 +877,25 @@ def get_query_args(query_args=None):
 def _get_response(request, auth, template, args=None):
     retry_timeout = 3
     errors = []
+    retry_count = 0
+    max_retries = 10  # Maximum number of retries to prevent infinite loops
+    
     # We'll make requests in a loop so we can
     # delay and retry in the case of rate-limiting
-    while True:
+    while retry_count < max_retries:
         should_continue = False
         try:
             r = urlopen(request, context=https_ctx)
         except HTTPError as exc:
-            errors, should_continue = _request_http_error(exc, auth, errors, args)  # noqa
+            errors, should_continue = _request_http_error(
+                exc, auth, errors, args
+            )  # noqa
             r = exc
+            
+            # For 401 errors, we've already cleared cached tokens and attempted to generate new ones
+            # The retry will use the fresh token generation mechanism in get_auth()
+            # No need for complex request header manipulation here
+                    
         except URLError as e:
             logger.warning(e.reason)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
@@ -779,9 +908,17 @@ def _get_response(request, auth, template, args=None):
                 raise
 
         if should_continue:
+            retry_count += 1
+            if retry_count >= max_retries:
+                logger.error(f"Maximum retry limit ({max_retries}) reached for {template}. Stopping to prevent infinite loop.")
+                break
             continue
 
         break
+    
+    if retry_count >= max_retries:
+        raise Exception(f"Request failed after {max_retries} retries for {template}. This may indicate a persistent issue with authentication or network connectivity.")
+    
     return r, errors
 
 
@@ -811,7 +948,7 @@ def _construct_request(
     log_url = template
     if querystring:
         log_url += "?" + querystring
-    logger.info("Requesting {}".format(log_url))
+    logger.debug("Requesting {}".format(log_url))
     return request
 
 
@@ -826,22 +963,29 @@ def _request_http_error(exc, auth, errors, args=None):
 
     # Handle GitHub App token expiry (401 Unauthorized)
     if exc.code == 401 and _github_app_credentials is not None:
-        logger.warning("GitHub App token expired (401 Unauthorized). Refreshing token...")
+        logger.warning(
+            "GitHub App token expired (401 Unauthorized). Refreshing token..."
+        )
         try:
-            # Force refresh the token
-            global _github_app_token, _github_app_token_expires
-            _github_app_token = None  # Force regeneration
-            _github_app_token_expires = None
+            # Force refresh the token - we need to clear all cached tokens
+            # since we don't know which specific installation token expired
+            global _github_app_tokens, _token_refresh_failures, _token_refresh_failure_times
+            _github_app_tokens.clear()  # Clear all cached tokens
             
-            new_token = get_or_refresh_github_app_token()
-            if new_token:
-                logger.info("Successfully refreshed GitHub App token")
-                should_continue = True
-            else:
-                logger.error("Failed to refresh GitHub App token")
+            # Also clear failure tracking since we're forcing a refresh
+            _token_refresh_failures.clear()
+            _token_refresh_failure_times.clear()
+
+            # Clear cached tokens - the next request will generate fresh tokens as needed
+            # This is simpler and more reliable than trying to pre-generate tokens here
+            logger.info("Cleared cached tokens, will generate fresh token on next request")
+            should_continue = True
         except Exception as e:
             logger.error(f"Error refreshing GitHub App token: {str(e)}")
+            # Don't continue if there's an error in the refresh process
+            should_continue = False
     elif exc.code == 403 and limit_remaining < 1:
+        # Rate limit exceeded - wait for reset time
         # The X-RateLimit-Reset header includes a
         # timestamp telling us when the limit will reset
         # so we can calculate how long to wait rather
@@ -860,6 +1004,12 @@ def _request_http_error(exc, auth, errors, args=None):
 
         if auth is None:
             logger.info("Hint: Authenticate to raise your GitHub rate limit")
+
+        # Always clear cached tokens when hitting rate limits to prevent using expired tokens after the wait
+        # GitHub App tokens expire after 1 hour, so any significant wait could cause expiration
+        if _github_app_credentials is not None:
+            logger.info("Rate limit hit, clearing cached tokens to prevent expiration during wait")
+            _github_app_tokens.clear()
 
         time.sleep(delta)
         should_continue = True
@@ -943,9 +1093,6 @@ def download_file(url, path, auth, as_app=True, fine=False):
         )
 
 
-
-
-
 def check_git_lfs_install():
     exit_code = subprocess.call(["git", "lfs", "version"])
     if exit_code != 0:
@@ -955,67 +1102,61 @@ def check_git_lfs_install():
 
 
 def retrieve_repositories(args, authenticated_user):
-    logger.info("Retrieving repositories")
-    
-    # For GitHub Apps with auto-discovery (no installation_id provided)
-    if not args.installation_id:
-        return retrieve_all_accessible_repositories(args)
-    
-    # For GitHub Apps with specific installation_id
-    if args.installation_id:
-        return retrieve_repositories_from_installation(args)
-    
-    # This should not happen - GitHub App authentication is mandatory
-    raise Exception("GitHub App authentication is required. Please provide --app-id and --private-key.")
+    """Retrieve repositories from all accessible GitHub App installations."""
+    logger.info("Retrieving repositories from all accessible installations")
+    return retrieve_all_accessible_repositories(args)
 
 
 def collect_backup_plan(args):
     """Collect all information about what would be backed up without actually backing up."""
     logger.info("Collecting backup plan...")
-    
+
     # Discover all installations
-    installations = discover_github_app_installations(args.app_id, args.private_key, get_github_api_host(args))
-    
+    installations = discover_github_app_installations(
+        args.app_id, args.private_key, get_github_api_host(args)
+    )
+
     if not installations:
         logger.warning("No GitHub App installations found")
         return []
-    
+
     backup_plan = []
     total_installations = len(installations)
-    
+
     for i, installation in enumerate(installations, 1):
         installation_id = installation.get("id")
         account = installation.get("account", {})
         account_type = account.get("type", "unknown")
         account_login = account.get("login", "unknown")
-        
+
         # Filter installations if specific users are specified
-        if args.user and account_login not in args.user:
-            logger.info(f"Skipping installation {i}/{total_installations}: {account_type} '{account_login}' (not in filter list)")
+        if args.users and account_login not in args.users:
+            logger.info(
+                f"Skipping installation {i}/{total_installations}: {account_type} '{account_login}' (not in filter list)"
+            )
             continue
-        
-        logger.info(f"Processing installation {i}/{total_installations}: {account_type} '{account_login}'")
-        
+
+        logger.info(
+            f"Processing installation {i}/{total_installations}: {account_type} '{account_login}'"
+        )
+
         try:
             # Generate token for this installation
-            token, expires_at = generate_github_app_token(args.app_id, installation_id, args.private_key)
-            
-            # Create temporary args with this installation's token
-            temp_args = type(args)()
-            for attr in dir(args):
-                if not attr.startswith('_'):
-                    setattr(temp_args, attr, getattr(args, attr))
-            temp_args.installation_id = installation_id
-            
+            token, expires_at = generate_github_app_token(
+                args.app_id, installation_id, args.private_key, get_github_api_host(args)
+            )
+
             # Get repositories for this installation
-            installation_repos = retrieve_repositories_from_installation(temp_args, token)
-            
+            installation_repos = retrieve_repositories_from_installation(
+                args, installation_id, token
+            )
+
             # Apply repository-level filters
             filtered_repos = apply_repository_filters(args, installation_repos)
-            
+
             # Count repositories (all are regular repositories now)
             regular_repos = filtered_repos
-            
+
             # Add installation context to each repository
             repos_with_context = []
             for repo in filtered_repos:
@@ -1024,7 +1165,7 @@ def collect_backup_plan(args):
                 repo_with_context["_account_type"] = account_type
                 repo_with_context["_account_login"] = account_login
                 repos_with_context.append(repo_with_context)
-            
+
             installation_info = {
                 "installation_id": installation_id,
                 "account_type": account_type,
@@ -1032,76 +1173,87 @@ def collect_backup_plan(args):
                 "repositories": repos_with_context,
                 "counts": {
                     "repositories": len(regular_repos),
-                    "total": len(filtered_repos)
-                }
+                    "total": len(filtered_repos),
+                },
             }
-            
+
             backup_plan.append(installation_info)
-            logger.info(f"Found {len(filtered_repos)} repositories in {account_type} '{account_login}' (filtered from {len(installation_repos)} total)")
-            
+            logger.info(
+                f"Found {len(filtered_repos)} repositories in {account_type} '{account_login}' (filtered from {len(installation_repos)} total)"
+            )
+
         except Exception as e:
-            logger.error(f"Failed to retrieve repositories from {account_type} '{account_login}': {str(e)}")
+            logger.error(
+                f"Failed to retrieve repositories from {account_type} '{account_login}': {str(e)}"
+            )
             continue
-    
+
     return backup_plan
 
 
 def retrieve_all_accessible_repositories(args):
     """Retrieve all repositories accessible to the GitHub App across all installations."""
     backup_plan = collect_backup_plan(args)
-    
+
     # Flatten all repositories from all installations
     all_repos = []
     for installation in backup_plan:
         all_repos.extend(installation["repositories"])
-    
+
     logger.info(f"Total repositories found across all installations: {len(all_repos)}")
-    
+
     # Log directory structure info
-    logger.info("Backups will be organized by account/org: {output_directory}/{owner}/repositories/{repo_name}")
-    
+    logger.info(
+        "Backups will be organized by account/org: {output_directory}/{owner}/repositories/{repo_name}"
+    )
+
     return all_repos
 
 
-def retrieve_repositories_from_installation(args, token=None):
+def retrieve_repositories_from_installation(args, installation_id, token=None):
     """Retrieve repositories from a specific GitHub App installation."""
     if token is None:
         # Use the global token system
         repos = []
-        template = "https://{0}/installation/repositories".format(get_github_api_host(args))
-        
+        template = "https://{0}/installation/repositories".format(
+            get_github_api_host(args)
+        )
+
         # Use the generator to process repositories one by one
-        installation_id = args.installation_id
-        for repo in retrieve_data_gen(args, template, single_request=False, installation_id=installation_id):
+        for repo in retrieve_data_gen(
+            args, template, installation_id, single_request=False
+        ):
             repos.append(repo)
-        
+
         return repos
     else:
         # Use provided token directly
-        template = "https://{0}/installation/repositories".format(get_github_api_host(args))
-        
+        template = "https://{0}/installation/repositories".format(
+            get_github_api_host(args)
+        )
+
         # Make direct API call with the provided token
         headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": f"github-backup/{VERSION}"
+            "User-Agent": f"github-backup/{VERSION}",
         }
-        
+
         repos = []
         page = 1
         per_page = 100
-        
+
         while True:
             url = f"{template}?per_page={per_page}&page={page}"
             request = Request(url, headers=headers)
-            
+
             try:
                 response = urlopen(request, context=https_ctx)
                 data = json.loads(response.read().decode("utf-8"))
-                
-                if isinstance(data, dict) and 'repositories' in data:
+
+                if isinstance(data, dict) and "repositories" in data:
                     # Installation repositories response format
-                    repos_list = data['repositories']
+                    repos_list = data["repositories"]
                     if not repos_list:
                         break
                     repos.extend(repos_list)
@@ -1116,26 +1268,29 @@ def retrieve_repositories_from_installation(args, token=None):
                         break
                 else:
                     break
-                    
+
                 page += 1
-                
+
             except Exception as e:
-                logger.error(f"Failed to retrieve repositories from page {page}: {str(e)}")
+                logger.error(
+                    f"Failed to retrieve repositories from page {page}: {str(e)}"
+                )
                 break
-        
+
         return repos
-
-
-
 
 
 def apply_repository_filters(args, repositories):
     """Apply all repository filters (name regex, languages, exclude) to repositories."""
-    if args.repository:
-        return repositories
-    
     filtered_repos = repositories
     
+    # Apply repository name filter
+    if args.repository:
+        filtered_repos = [
+            r for r in filtered_repos 
+            if r.get("name") == args.repository or r.get("full_name") == args.repository
+        ]
+
     # Apply name regex filter
     if args.name_regex:
         name_regex = re.compile(args.name_regex)
@@ -1155,7 +1310,9 @@ def apply_repository_filters(args, repositories):
     # Apply exclude filter
     if args.exclude:
         filtered_repos = [
-            r for r in filtered_repos if "name" not in r or r["name"] not in args.exclude
+            r
+            for r in filtered_repos
+            if "name" not in r or r["name"] not in args.exclude
         ]
 
     return filtered_repos
@@ -1172,22 +1329,25 @@ def backup_repositories(args, output_directory, repositories):
     logger.info(f"Number of repositories to backup: {len(repositories)}")
     repos_template = "https://{0}/repos".format(get_github_api_host(args))
 
-    if args.incremental:
-        last_update_path = os.path.join(output_directory, "last_update")
-        if os.path.exists(last_update_path):
-            args.since = open(last_update_path).read().strip()
-        else:
-            args.since = None
-    else:
-        args.since = None
+    # Incremental backup is now always based on file modification times
 
     last_update = "0000-00-00T00:00:00Z"
     for i, repository in enumerate(repositories, 1):
-        logger.info(f"Processing repository {i}/{len(repositories)}: {repository.get('name', 'unknown')}")
+        logger.info(
+            f"Processing repository {i}/{len(repositories)}: {repository.get('full_name', 'unknown')}"
+        )
         try:
-            if "updated_at" in repository and repository["updated_at"] is not None and repository["updated_at"] > last_update:
+            if (
+                "updated_at" in repository
+                and repository["updated_at"] is not None
+                and repository["updated_at"] > last_update
+            ):
                 last_update = repository["updated_at"]
-            elif "pushed_at" in repository and repository["pushed_at"] is not None and repository["pushed_at"] > last_update:
+            elif (
+                "pushed_at" in repository
+                and repository["pushed_at"] is not None
+                and repository["pushed_at"] > last_update
+            ):
                 last_update = repository["pushed_at"]
         except TypeError as e:
             repo_name = repository.get("name", "unknown")
@@ -1202,7 +1362,7 @@ def backup_repositories(args, output_directory, repositories):
         # Get the owner information
         owner = repository.get("owner", {}).get("login", "unknown")
         owner_type = repository.get("owner", {}).get("type", "User")
-        
+
         # For repositories, organize by owner as top level
         repo_cwd = os.path.join(
             output_directory, owner, "repositories", repository["name"]
@@ -1224,8 +1384,6 @@ def backup_repositories(args, output_directory, repositories):
                 lfs_clone=args.lfs_clone,
                 no_prune=args.no_prune,
             )
-
-
 
         download_wiki = args.include_wiki or args.include_everything
         if repository["has_wiki"] and download_wiki:
@@ -1262,11 +1420,7 @@ def backup_repositories(args, output_directory, repositories):
                 include_assets=args.include_assets or args.include_everything,
             )
 
-    if args.incremental:
-        if last_update == "0000-00-00T00:00:00Z":
-            last_update = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.localtime())
-
-        open(last_update_path, "w").write(last_update)
+    # No need to write last_update file since incremental backup is now based on file modification times
 
 
 def backup_issues(args, repo_cwd, repository, repos_template):
@@ -1274,7 +1428,7 @@ def backup_issues(args, repo_cwd, repository, repos_template):
     if args.skip_existing and has_issues_dir:
         return
 
-    logger.info("Retrieving {0} issues".format(repository["full_name"]))
+    logger.info("Retrieving issues")
     issue_cwd = os.path.join(repo_cwd, "issues")
     mkdir_p(repo_cwd, issue_cwd)
 
@@ -1287,11 +1441,14 @@ def backup_issues(args, repo_cwd, repository, repos_template):
     issue_states = ["open", "closed"]
     for issue_state in issue_states:
         query_args = {"filter": "all", "state": issue_state}
-        if args.since:
-            query_args["since"] = args.since
 
         installation_id = repository.get("_installation_id")
-        _issues = retrieve_data(args, _issue_template, query_args=query_args, installation_id=installation_id)
+        _issues = retrieve_data(
+            args,
+            _issue_template,
+            installation_id,
+            query_args=query_args,
+        )
         for issue in _issues:
             # skip pull requests which are also returned as issues
             # if retrieving pull requests is requested as well
@@ -1304,21 +1461,26 @@ def backup_issues(args, repo_cwd, repository, repos_template):
     if issues_skipped:
         issues_skipped_message = " (skipped {0} pull requests)".format(issues_skipped)
 
-    logger.info(
-        "Saving {0} issues to disk{1}".format(
-            len(list(issues.keys())), issues_skipped_message
-        )
-    )
+    logger.info(f"Saving {len(list(issues.keys()))} issues to disk{issues_skipped_message}")
     comments_template = _issue_template + "/{0}/comments"
     events_template = _issue_template + "/{0}/events"
     for number, issue in list(issues.items()):
         issue_file = "{0}/{1}.json".format(issue_cwd, number)
-        if args.incremental_by_files and os.path.isfile(issue_file):
+        if args.incremental and os.path.isfile(issue_file):
             try:
                 modified = os.path.getmtime(issue_file)
-                modified = datetime.fromtimestamp(modified).strftime("%Y-%m-%dT%H:%M:%SZ")
-                if issue.get("updated_at") is not None and modified > issue["updated_at"]:
-                    logger.info("Skipping issue {0} because it wasn't modified since last backup".format(number))
+                modified = datetime.fromtimestamp(modified).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                if (
+                    issue.get("updated_at") is not None
+                    and modified > issue["updated_at"]
+                ):
+                    logger.info(
+                        "Skipping issue {0} because it wasn't modified since last backup".format(
+                            number
+                        )
+                    )
                     continue
             except TypeError as e:
                 logger.error(
@@ -1330,15 +1492,21 @@ def backup_issues(args, repo_cwd, repository, repos_template):
         if args.include_issue_comments or args.include_everything:
             template = comments_template.format(number)
             installation_id = repository.get("_installation_id")
-            issues[number]["comment_data"] = retrieve_data(args, template, installation_id=installation_id)
+            issues[number]["comment_data"] = retrieve_data(
+                args, template, installation_id
+            )
         if args.include_issue_events or args.include_everything:
             template = events_template.format(number)
             installation_id = repository.get("_installation_id")
-            issues[number]["event_data"] = retrieve_data(args, template, installation_id=installation_id)
+            issues[number]["event_data"] = retrieve_data(
+                args, template, installation_id
+            )
 
         with codecs.open(issue_file + ".temp", "w", encoding="utf-8") as f:
             json_dump(issue, f)
-            os.rename(issue_file + ".temp", issue_file)  # Unlike json_dump, this is atomic
+            os.rename(
+                issue_file + ".temp", issue_file
+            )  # Unlike json_dump, this is atomic
 
 
 def backup_pulls(args, repo_cwd, repository, repos_template):
@@ -1346,7 +1514,7 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
     if args.skip_existing and has_pulls_dir:
         return
 
-    logger.info("Retrieving {0} pull requests".format(repository["full_name"]))  # noqa
+    logger.info("Retrieving pull requests")
     pulls_cwd = os.path.join(repo_cwd, "pulls")
     mkdir_p(repo_cwd, pulls_cwd)
 
@@ -1365,46 +1533,32 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
         for pull_state in pull_states:
             query_args["state"] = pull_state
             installation_id = repository.get("_installation_id")
-            _pulls = retrieve_data_gen(args, _pulls_template, query_args=query_args, installation_id=installation_id)
+            _pulls = retrieve_data_gen(
+                args,
+                _pulls_template,
+                installation_id,
+                query_args=query_args,
+            )
             for pull in _pulls:
-                try:
-                    if args.since and pull.get("updated_at") is not None and pull["updated_at"] < args.since:
-                        break
-                    if not args.since or (pull.get("updated_at") is not None and pull["updated_at"] >= args.since):
-                        pulls[pull["number"]] = pull
-                except TypeError as e:
-                    pull_number = pull.get("number", "unknown")
-                    logger.error(
-                        f"Error comparing timestamps for pull request #{pull_number} in repository '{repository.get('full_name', 'unknown')}': {str(e)}. "
-                        f"Pull request data: updated_at={pull.get('updated_at')}. "
-                        f"Skipping this pull request."
-                    )
-                    continue
+                pulls[pull["number"]] = pull
     else:
         installation_id = repository.get("_installation_id")
-        _pulls = retrieve_data_gen(args, _pulls_template, query_args=query_args, installation_id=installation_id)
+        _pulls = retrieve_data_gen(
+            args,
+            _pulls_template,
+            installation_id,
+            query_args=query_args,
+        )
         for pull in _pulls:
-            try:
-                if args.since and pull.get("updated_at") is not None and pull["updated_at"] < args.since:
-                    break
-                if not args.since or (pull.get("updated_at") is not None and pull["updated_at"] >= args.since):
-                    installation_id = repository.get("_installation_id")
-                    pulls[pull["number"]] = retrieve_data(
-                        args,
-                        _pulls_template + "/{}".format(pull["number"]),
-                        single_request=True,
-                        installation_id=installation_id
-                    )[0]
-            except TypeError as e:
-                pull_number = pull.get("number", "unknown")
-                logger.error(
-                    f"Error comparing timestamps for pull request #{pull_number} in repository '{repository.get('full_name', 'unknown')}': {str(e)}. "
-                    f"Pull request data: updated_at={pull.get('updated_at')}. "
-                    f"Skipping this pull request."
-                )
-                continue
+            installation_id = repository.get("_installation_id")
+            pulls[pull["number"]] = retrieve_data(
+                args,
+                _pulls_template + "/{}".format(pull["number"]),
+                installation_id,
+                single_request=True,
+            )[0]
 
-    logger.info("Saving {0} pull requests to disk".format(len(list(pulls.keys()))))
+    logger.info(f"Saving {len(list(pulls.keys()))} pull requests to disk")
     # Comments from pulls API are only _review_ comments
     # regular comments need to be fetched via issue API.
     # For backwards compatibility with versions <= 0.41.0
@@ -1414,12 +1568,18 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
     commits_template = _pulls_template + "/{0}/commits"
     for number, pull in list(pulls.items()):
         pull_file = "{0}/{1}.json".format(pulls_cwd, number)
-        if args.incremental_by_files and os.path.isfile(pull_file):
+        if args.incremental and os.path.isfile(pull_file):
             try:
                 modified = os.path.getmtime(pull_file)
-                modified = datetime.fromtimestamp(modified).strftime("%Y-%m-%dT%H:%M:%SZ")
+                modified = datetime.fromtimestamp(modified).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
                 if pull.get("updated_at") is not None and modified > pull["updated_at"]:
-                    logger.info("Skipping pull request {0} because it wasn't modified since last backup".format(number))
+                    logger.info(
+                        "Skipping pull request {0} because it wasn't modified since last backup".format(
+                            number
+                        )
+                    )
                     continue
             except TypeError as e:
                 logger.error(
@@ -1430,17 +1590,25 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
         if args.include_pull_comments or args.include_everything:
             template = comments_regular_template.format(number)
             installation_id = repository.get("_installation_id")
-            pulls[number]["comment_regular_data"] = retrieve_data(args, template, installation_id=installation_id)
+            pulls[number]["comment_regular_data"] = retrieve_data(
+                args, template, installation_id
+            )
             template = comments_template.format(number)
-            pulls[number]["comment_data"] = retrieve_data(args, template, installation_id=installation_id)
+            pulls[number]["comment_data"] = retrieve_data(
+                args, template, installation_id
+            )
         if args.include_pull_commits or args.include_everything:
             template = commits_template.format(number)
             installation_id = repository.get("_installation_id")
-            pulls[number]["commit_data"] = retrieve_data(args, template, installation_id=installation_id)
+            pulls[number]["commit_data"] = retrieve_data(
+                args, template, installation_id
+            )
 
         with codecs.open(pull_file + ".temp", "w", encoding="utf-8") as f:
             json_dump(pull, f)
-            os.rename(pull_file + ".temp", pull_file)  # Unlike json_dump, this is atomic
+            os.rename(
+                pull_file + ".temp", pull_file
+            )  # Unlike json_dump, this is atomic
 
 
 def backup_milestones(args, repo_cwd, repository, repos_template):
@@ -1448,7 +1616,7 @@ def backup_milestones(args, repo_cwd, repository, repos_template):
     if args.skip_existing and os.path.isdir(milestone_cwd):
         return
 
-    logger.info("Retrieving {0} milestones".format(repository["full_name"]))
+    logger.info("Retrieving milestones")
     mkdir_p(repo_cwd, milestone_cwd)
 
     template = "{0}/{1}/milestones".format(repos_template, repository["full_name"])
@@ -1456,13 +1624,15 @@ def backup_milestones(args, repo_cwd, repository, repos_template):
     query_args = {"state": "all"}
 
     installation_id = repository.get("_installation_id")
-    _milestones = retrieve_data(args, template, query_args=query_args, installation_id=installation_id)
+    _milestones = retrieve_data(
+        args, template, installation_id, query_args=query_args
+    )
 
     milestones = {}
     for milestone in _milestones:
         milestones[milestone["number"]] = milestone
 
-    logger.info("Saving {0} milestones to disk".format(len(list(milestones.keys()))))
+    logger.info(f"Saving {len(list(milestones.keys()))} milestones to disk")
     for number, milestone in list(milestones.items()):
         milestone_file = "{0}/{1}.json".format(milestone_cwd, number)
         with codecs.open(milestone_file, "w", encoding="utf-8") as f:
@@ -1474,7 +1644,14 @@ def backup_labels(args, repo_cwd, repository, repos_template):
     output_file = "{0}/labels.json".format(label_cwd)
     template = "{0}/{1}/labels".format(repos_template, repository["full_name"])
     installation_id = repository.get("_installation_id")
-    _backup_data(args, "labels", template, output_file, label_cwd, installation_id=installation_id)
+    _backup_data(
+        args,
+        "labels",
+        template,
+        output_file,
+        label_cwd,
+        installation_id,
+    )
 
 
 def backup_hooks(args, repo_cwd, repository, repos_template):
@@ -1485,11 +1662,37 @@ def backup_hooks(args, repo_cwd, repository, repos_template):
     hook_cwd = os.path.join(repo_cwd, "hooks")
     output_file = "{0}/hooks.json".format(hook_cwd)
     template = "{0}/{1}/hooks".format(repos_template, repository["full_name"])
+    
+    # Log installation context for debugging
+    account_type = repository.get("_account_type", "unknown")
+    account_login = repository.get("_account_login", "unknown")
+    repo_name = repository.get("full_name", "unknown")
+    repo_private = repository.get("private", False)
+    
     try:
-        _backup_data(args, "hooks", template, output_file, hook_cwd, installation_id=installation_id)
+        _backup_data(
+            args,
+            "hooks",
+            template,
+            output_file,
+            hook_cwd,
+            installation_id,
+        )
     except Exception as e:
         if "404" in str(e):
             logger.info("Unable to read hooks, skipping")
+        elif "403" in str(e):
+            # Handle 403 Forbidden - this can happen for various reasons:
+            # 1. Repository-specific permission restrictions
+            # 2. Organization-level webhook access policies
+            # 3. Repository is archived or has restricted access
+            # 4. Different GitHub App installation permissions between user and org
+            logger.warning(
+                f"Access denied to hooks for repository '{repo_name}' (HTTP 403). "
+                f"Installation: {installation_id} ({account_type}: {account_login}). "
+                f"This may be due to repository-specific restrictions, organization policies, "
+                f"or different GitHub App installation permissions. Skipping hooks backup for this repository."
+            )
         else:
             raise e
 
@@ -1499,14 +1702,16 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
 
     # give release files somewhere to live & log intent
     release_cwd = os.path.join(repo_cwd, "releases")
-    logger.info("Retrieving {0} releases".format(repository_fullname))
+    logger.info("Retrieving releases")
     mkdir_p(repo_cwd, release_cwd)
 
     query_args = {}
 
     release_template = "{0}/{1}/releases".format(repos_template, repository_fullname)
     installation_id = repository.get("_installation_id")
-    releases = retrieve_data(args, release_template, query_args=query_args, installation_id=installation_id)
+    releases = retrieve_data(
+        args, release_template, installation_id, query_args=query_args
+    )
 
     if args.skip_prerelease:
         releases = [r for r in releases if not r["prerelease"] and not r["draft"]]
@@ -1521,9 +1726,9 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
             reverse=True,
         )
         releases = releases[: args.number_of_latest_releases]
-        logger.info("Saving the latest {0} releases to disk".format(len(releases)))
+        logger.info(f"Saving the latest {len(releases)} releases to disk")
     else:
-        logger.info("Saving {0} releases to disk".format(len(releases)))
+        logger.info(f"Saving {len(releases)} releases to disk")
 
     # for each release, store it
     for release in releases:
@@ -1537,7 +1742,9 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
 
         if include_assets:
             installation_id = repository.get("_installation_id")
-            assets = retrieve_data(args, release["assets_url"], installation_id=installation_id)
+            assets = retrieve_data(
+                args, release["assets_url"], installation_id
+            )
             if len(assets) > 0:
                 # give release asset files somewhere to live & download them (not including source archives)
                 release_assets_cwd = os.path.join(release_cwd, release_name_safe)
@@ -1546,7 +1753,7 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
                     download_file(
                         asset["url"],
                         os.path.join(release_assets_cwd, asset["name"]),
-                        get_auth(args, encode=False, installation_id=installation_id),
+                        get_auth(args, installation_id, encode=False),
                         as_app=True,
                         fine=False,
                     )
@@ -1583,15 +1790,11 @@ def fetch_repository(
         "git ls-remote " + remote_url, stdout=FNULL, stderr=FNULL, shell=True
     )
     if initialized == 128:
-        logger.info(
-            "Skipping {0} ({1}) since it's not initialized".format(
-                name, masked_remote_url
-            )
-        )
+        logger.debug(f"Skipping {name} wiki (not initialized)")
         return
 
     if clone_exists:
-        logger.info("Updating {0} in {1}".format(name, local_dir))
+        logger.info(f"Updating {name} in {local_dir}")
 
         remotes = subprocess.check_output(["git", "remote", "show"], cwd=local_dir)
         remotes = [i.strip() for i in remotes.decode("utf-8").splitlines()]
@@ -1640,18 +1843,16 @@ def backup_account(args, output_directory):
     account_cwd = os.path.join(output_directory, "account")
 
 
-
-
-
-
-def _backup_data(args, name, template, output_file, output_directory, installation_id=None):
+def _backup_data(
+    args, name, template, output_file, output_directory, installation_id
+):
     skip_existing = args.skip_existing
     if not skip_existing or not os.path.exists(output_file):
-        logger.info("Retrieving {0} {1}".format(args.user, name))
+        logger.info(f"Retrieving {name}")
         mkdir_p(output_directory)
-        data = retrieve_data(args, template, installation_id=installation_id)
+        data = retrieve_data(args, template, installation_id)
 
-        logger.info("Writing {0} {1} to disk".format(len(data), name))
+        logger.info(f"Writing {len(data)} {name} to disk")
         with codecs.open(output_file, "w", encoding="utf-8") as f:
             json_dump(data, f)
 

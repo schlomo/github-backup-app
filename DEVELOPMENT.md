@@ -1,64 +1,74 @@
 # Development Setup Guide
 
-This guide will help you set up a development environment for the `python-github-backup` project.
+This guide will help you set up a development environment for the `github-backup-app` project using modern Python tooling.
 
 ## Prerequisites
 
-- Python 3.8+ (tested with Python 3.13.3)
+- Python 3.12+ (tested with Python 3.13.3)
 - Git
-- Virtual environment tool (venv, virtualenv, or conda)
+- [uv](https://github.com/astral-sh/uv) (fast Python package manager)
 
 ## Quick Setup
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/josegonzalez/python-github-backup.git
-cd python-github-backup
+git clone https://github.com/schlomo/github-backup-app.git
+cd github-backup-app
 ```
 
-### 2. Create and Activate Virtual Environment
-
-**Using venv (recommended):**
+### 2. Install uv (if not already installed)
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # On Unix/macOS
-# or
-venv\Scripts\activate     # On Windows
+# On macOS with Homebrew (recommended)
+brew install uv
+
+# Or using the official installer
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**Using fish shell:**
+### 3. Set up Development Environment
+
+**Option A: Using the setup script (recommended):**
 ```bash
-python3 -m venv venv
-source venv/bin/activate.fish
+./dev-setup.sh
 ```
 
-### 3. Install Dependencies
-
+**Option B: Manual setup:**
 ```bash
-# Upgrade pip
-pip install --upgrade pip
+# Install all dependencies (runtime + dev)
+uv sync --dev
 
-# Install runtime dependencies
-pip install -r requirements.txt
+# Activate the virtual environment
+source .venv/bin/activate
 
-# Install development dependencies
-pip install -r release-requirements.txt
+# Verify installation
+python -c "import github_backup; print('Import successful')"
+```
 
-# Install the package in development mode
-pip install -e .
+**Option C: Using uv directly:**
+```bash
+uv sync --dev
 ```
 
 ### 4. Verify Installation
 
+First, activate the virtual environment:
+```bash
+source .venv/bin/activate
+```
+
+Then test the installation:
 ```bash
 # Test the CLI
-github-backup -h
+github-backup --help
 
 # Test linting
-flake8 --ignore=E501 github_backup/
+flake8 github_backup/
 
 # Test code formatting
 black --check github_backup/
+
+# Test import
+python -c "import github_backup; print('Import successful')"
 ```
 
 ## Development Tools
@@ -74,13 +84,21 @@ black --check github_backup/
 Currently, this project has no unit tests. To run linting:
 
 ```bash
-flake8 --ignore=E501 github_backup/
+# Activate the virtual environment first
+source .venv/bin/activate
+
+# Then run linting
+flake8 github_backup/
 ```
 
 ### Code Formatting
 
 To format code with black:
 ```bash
+# Activate the virtual environment first
+source .venv/bin/activate
+
+# Then format code
 black github_backup/
 ```
 
@@ -92,149 +110,69 @@ black --check github_backup/
 ## Project Structure
 
 ```
-python-github-backup/
-├── github_backup/           # Main package
-│   ├── __init__.py         # Package initialization
-│   └── github_backup.py    # Main application logic
-├── bin/                    # Executable scripts
-│   └── github-backup       # CLI entry point
-├── requirements.txt        # Runtime dependencies
-├── release-requirements.txt # Development dependencies
-├── setup.py               # Package configuration
-└── README.rst             # Project documentation
+github-backup-app/
+├── github_backup/                   # Main package
+│   ├── __init__.py                  # Package initialization
+│   ├── github_backup.py             # Main application logic
+│   └── create_github_app.py         # Script to automate creation of a GitHub App
+├── bin/                             # Executable scripts
+│   ├── github-backup                # Backup tool CLI entry point
+│   └── github-backup-create-app     # GitHub App creation CLI entry poing
+├── .github/
+│   └── workflows/                   # GitHub Actions CI/CD
+│       ├── ci.yml                   # Continuous Integration
+│       ├── docker.yml               # Docker build and push
+│       └── release.yml              # Release automation
+├── pyproject.toml                   # Modern Python packaging configuration
+├── uv.lock                          # Dependency lock file
+├── dev-setup.sh                     # Development setup script
+├── .flake8                          # Flake8 configuration
+└── README.md                        # Project documentation
 ```
-
-## Key Dependencies
-
-### Runtime Dependencies
-- `PyJWT>=2.0.0`: For GitHub App authentication
-- `cryptography>=3.0.0`: For cryptographic operations
-
-### Development Dependencies
-- `flake8`: Code linting
-- `black`: Code formatting
-- `autopep8`: PEP 8 formatting
-- `twine`: Package distribution
-- `gitchangelog`: Changelog generation
 
 ## Running the Application
 
 ### Basic Usage
+
+First, activate the virtual environment:
+```bash
+source .venv/bin/activate
+```
+
+Then use the application:
 ```bash
 # Show help
-github-backup -h
+github-backup --help
 
-# Backup a user's public repositories
-github-backup username --output-directory ./backup
-
-# Backup with authentication
-github-backup username --token YOUR_TOKEN --private --output-directory ./backup
+# Backup a user's public repositories (requires GitHub App authentication)
+github-backup username --app-id YOUR_APP_ID --private-key YOUR_PRIVATE_KEY --output-directory ./backup
 ```
 
 ### Development Testing
 ```bash
+# Activate the virtual environment first
+source .venv/bin/activate
+
 # Run directly from source
-python bin/github-backup -h
+python bin/github-backup --help
 
 # Run the main module
-python -m github_backup.github_backup -h
+python -m github_backup.github_backup --help
+
+# Use the installed command
+github-backup --help
 ```
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Make your changes
-4. Run linting: `flake8 --ignore=E501 github_backup/`
-5. Format code: `black github_backup/`
-6. Test your changes
-7. Submit a pull request
+3. Set up development environment: `./dev-setup.sh`
+4. Activate the virtual environment: `source .venv/bin/activate`
+5. Make your changes
+6. Run linting: `flake8 github_backup/`
+7. Format code: `black github_backup/`
+8. Test your changes: `python -c "import github_backup; print('Import successful')"`
+9. Submit a pull request
 
-## Environment Variables
-
-For development, you might want to set these environment variables:
-
-```bash
-export GITHUB_TOKEN=your_github_token
-export GITHUB_USERNAME=your_github_username
-```
-
-## Troubleshooting
-
-### Virtual Environment Issues
-- Make sure you're using the correct Python version (3.8+)
-- If you get permission errors, try: `python3 -m venv venv --user`
-
-### Import Errors
-- Ensure the package is installed in development mode: `pip install -e .`
-- Check that your virtual environment is activated
-
-### Linting Issues
-- The project uses specific flake8 ignore patterns
-- Some style issues are expected in the existing codebase
-- Use `black` to automatically format code
-
-### GitHub App Authentication Issues
-
-If you encounter "Could not parse the provided public key" errors when using GitHub App authentication:
-
-1. **Check your private key file**: Ensure it's a complete PEM file with all lines
-2. **Use the test script**: Run `./test_github_app_auth.py` to verify your setup
-3. **Verify file permissions**: Make sure the private key file is readable
-4. **Check file format**: The private key should be in PEM format (RSA or PKCS#8)
-
-**Test your GitHub App authentication:**
-```bash
-# Set your environment variables
-export GITHUB_APP_ID=your_app_id
-export GITHUB_INSTALLATION_ID=your_installation_id
-export GITHUB_PRIVATE_KEY=/path/to/your-app.pem
-
-# Run the test script
-./test_github_app_auth.py
-```
-
-**Common issues:**
-- Private key file truncated or corrupted
-- Incorrect App ID or Installation ID
-- Missing GitHub App permissions
-- File path issues (use absolute paths)
-
-**Note**: This project includes several optimizations for GitHub App authentication:
-
-1. **Private Key Parsing Fix**: Resolved the "Could not parse the provided public key" error by:
-   - Reading private key files completely (not just the first line)
-   - Supporting both `file://` prefixed paths and direct file paths
-   - Adding proper error handling for file reading operations
-
-2. **Simplified Token Management**: Implemented a robust and simple approach:
-   - Always call `get_auth()` before each API request
-   - Let the caching logic in `get_or_refresh_github_app_token()` handle optimization
-   - No complex error handling or retry logic needed
-   - 5-minute buffer before token expiry for seamless refresh
-   - Automatic token regeneration when needed
-   - Proper timezone handling for token expiration comparison
-
-3. **API Request Simplification**: Streamlined authentication flow:
-   - Each API call gets fresh authentication (caching handles efficiency)
-   - Eliminated complex error handling for token expiration
-   - More reliable and easier to maintain
-   - Works seamlessly with any token lifetime
-
-4. **Bug Fixes**:
-   - Fixed parameter order bug in `_construct_request()` that caused pagination to start at page 100
-   - Fixed `b"..."` string issue in `logging_subprocess()` by properly decoding bytes to strings
-   - Fixed timezone handling in token expiration comparison
-
-## Next Steps
-
-1. Read the main README.rst for usage examples
-2. Explore the `github_backup.py` file to understand the codebase
-3. Set up your GitHub authentication for testing
-4. Start contributing!
-
-## Support
-
-- Check the [README.rst](README.rst) for detailed usage information
-- Review the [CHANGES.rst](CHANGES.rst) for recent updates
-- Open an issue on GitHub for bugs or feature requests
+The CI/CD pipeline will automatically run tests, linting, and formatting checks on your pull request.
