@@ -53,6 +53,7 @@ def generate_app_name(username: str) -> str:
     # Last resort: truncate username
     return clean_username[:34]
 
+
 try:
     current_username = getpass.getuser()
 except Exception as e:
