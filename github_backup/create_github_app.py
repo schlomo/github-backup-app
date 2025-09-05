@@ -775,7 +775,9 @@ from your OS username. You can change this in the web interface if desired.
     try:
         print("🚀 Starting GitHub App Creator...")
         print(f"📁 Credentials will be saved to: {args.output_dir}")
-        print(f"🌐 Opening browser to: http://localhost:{args.port}")
+        print(
+            f"🌐 Opening browser to: http://localhost:{args.port}, please open this URL if it doesn't open automatically"
+        )
 
         # Open browser
         webbrowser.open(f"http://localhost:{args.port}")
