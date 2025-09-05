@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 
-
 import argparse
 import base64
 import calendar
@@ -47,9 +46,13 @@ FILE_URI_PREFIX = "file://"
 logger = logging.getLogger(__name__)
 
 # Global variables for GitHub App token management
-_github_app_tokens = {}  # Cache tokens per installation: {installation_id: (token, expires_at)}
+_github_app_tokens = (
+    {}
+)  # Cache tokens per installation: {installation_id: (token, expires_at)}
 _github_app_credentials = None
-_token_refresh_failures = {}  # Track consecutive token refresh failures per installation
+_token_refresh_failures = (
+    {}
+)  # Track consecutive token refresh failures per installation
 _token_refresh_failure_times = {}  # Track when failures occurred for backoff
 
 https_ctx = ssl.create_default_context()
@@ -141,7 +144,9 @@ def mask_password(url, secret="*****"):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(description="Backup GitHub repositories and metadata using GitHub App authentication")
+    parser = argparse.ArgumentParser(
+        description="Backup GitHub repositories and metadata using GitHub App authentication"
+    )
     parser.add_argument(
         "users",
         metavar="USER",
@@ -314,7 +319,6 @@ def parse_args(args=None):
         help="name of repository to limit backup to",
     )
 
-
     parser.add_argument(
         "-v", "--version", action="version", version="%(prog)s " + VERSION
     )
@@ -385,15 +389,13 @@ def validate_args(args):
         )
 
 
-
-
 def get_auth(args, installation_id, encode=True, for_git_cli=False):
     """Get authentication for GitHub App for a specific installation."""
     global _github_app_credentials
 
     if not installation_id:
         raise Exception("Installation ID is required for authentication.")
-    
+
     logger.debug(f"get_auth called with installation_id={installation_id}")
 
     # Store credentials globally for token refresh (only if not already set)
@@ -409,14 +411,16 @@ def get_auth(args, installation_id, encode=True, for_git_cli=False):
     token = get_or_refresh_github_app_token(installation_id, github_host)
     if not token:
         raise Exception("Failed to generate GitHub App installation token")
-    
+
     # Log token details for debugging
     logger.debug(f"Using token: {token[:10]}...{token[-10:]} (length: {len(token)})")
-    if not token.startswith('ghs_'):
+    if not token.startswith("ghs_"):
         raise Exception(f"Token doesn't start with 'ghs_': {token[:20]}...")
-    
+
     # Log successful token usage
-    logger.debug(f"Successfully obtained valid token for installation {installation_id}")
+    logger.debug(
+        f"Successfully obtained valid token for installation {installation_id}"
+    )
 
     if not for_git_cli:
         auth = token
@@ -429,7 +433,9 @@ def get_auth(args, installation_id, encode=True, for_git_cli=False):
     return base64.b64encode(auth.encode("ascii"))
 
 
-def generate_github_app_token(app_id, installation_id, private_key, github_host="api.github.com"):
+def generate_github_app_token(
+    app_id, installation_id, private_key, github_host="api.github.com"
+):
     """Generate an installation access token for GitHub App authentication."""
     try:
         # Load private key
@@ -451,9 +457,7 @@ def generate_github_app_token(app_id, installation_id, private_key, github_host=
         jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
 
         # Request installation access token
-        url = (
-            f"https://{github_host}/app/installations/{installation_id}/access_tokens"
-        )
+        url = f"https://{github_host}/app/installations/{installation_id}/access_tokens"
         headers = {
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github.v3+json",
@@ -473,12 +477,12 @@ def generate_github_app_token(app_id, installation_id, private_key, github_host=
             f"Generated GitHub App installation token for installation {installation_id} (expires at {expires_at})"
         )
         logger.debug(f"Token starts with: {token[:10]}...")
-        
+
         # Validate the token
         logger.debug(f"Validating generated token for installation {installation_id}")
         if not validate_github_app_token(token, github_host):
             raise Exception("Generated token failed validation")
-        
+
         logger.info(f"Token validation successful for installation {installation_id}")
         return token, expires_at
 
@@ -489,25 +493,27 @@ def generate_github_app_token(app_id, installation_id, private_key, github_host=
 def _is_token_refresh_circuit_open(installation_id):
     """Check if the circuit breaker is open for token refresh failures."""
     global _token_refresh_failures, _token_refresh_failure_times
-    
+
     failures = _token_refresh_failures.get(installation_id, 0)
     if failures < 3:  # Allow up to 3 consecutive failures
         return False
-    
+
     # Check if enough time has passed since last failure (exponential backoff)
     last_failure_time = _token_refresh_failure_times.get(installation_id)
     if not last_failure_time:
         return False
-    
+
     # Exponential backoff: 2^failures minutes, max 30 minutes
-    backoff_minutes = min(2 ** failures, 30)
+    backoff_minutes = min(2**failures, 30)
     backoff_duration = timedelta(minutes=backoff_minutes)
-    
+
     if datetime.utcnow() - last_failure_time < backoff_duration:
-        logger.warning(f"Circuit breaker open for installation {installation_id}. "
-                      f"Failed {failures} times, waiting {backoff_minutes} minutes before retry.")
+        logger.warning(
+            f"Circuit breaker open for installation {installation_id}. "
+            f"Failed {failures} times, waiting {backoff_minutes} minutes before retry."
+        )
         return True
-    
+
     return False
 
 
@@ -521,7 +527,9 @@ def _record_token_refresh_success(installation_id):
 def _record_token_refresh_failure(installation_id):
     """Record a token refresh failure, incrementing failure counters."""
     global _token_refresh_failures, _token_refresh_failure_times
-    _token_refresh_failures[installation_id] = _token_refresh_failures.get(installation_id, 0) + 1
+    _token_refresh_failures[installation_id] = (
+        _token_refresh_failures.get(installation_id, 0) + 1
+    )
     _token_refresh_failure_times[installation_id] = datetime.utcnow()
 
 
@@ -536,8 +544,10 @@ def get_or_refresh_github_app_token(installation_id, github_host="api.github.com
 
     # Check circuit breaker first
     if _is_token_refresh_circuit_open(installation_id):
-        raise Exception(f"Token refresh circuit breaker is open for installation {installation_id}. "
-                       "Too many consecutive failures. Please check your GitHub App credentials and network connectivity.")
+        raise Exception(
+            f"Token refresh circuit breaker is open for installation {installation_id}. "
+            "Too many consecutive failures. Please check your GitHub App credentials and network connectivity."
+        )
 
     # Check if we have a cached token for this installation
     cached_token, cached_expires = _github_app_tokens.get(installation_id, (None, None))
@@ -545,11 +555,7 @@ def get_or_refresh_github_app_token(installation_id, github_host="api.github.com
     # Simple approach: Check if token exists and is not expired (with 5-minute buffer)
     # Convert both times to UTC for comparison (GitHub API returns UTC times)
     now_utc = datetime.utcnow()
-    expires_utc = (
-        cached_expires.replace(tzinfo=None)
-        if cached_expires
-        else None
-    )
+    expires_utc = cached_expires.replace(tzinfo=None) if cached_expires else None
 
     # Generate new token if:
     # 1. No token exists for this installation
@@ -559,9 +565,13 @@ def get_or_refresh_github_app_token(installation_id, github_host="api.github.com
         or expires_utc is None
         or now_utc >= (expires_utc - timedelta(minutes=5))
     ):
-        logger.info(f"Generating new GitHub App token for installation {installation_id}...")
-        logger.debug(f"Token generation conditions: token_exists={cached_token is not None}, expires_utc={expires_utc}, now_utc={now_utc}")
-        
+        logger.info(
+            f"Generating new GitHub App token for installation {installation_id}..."
+        )
+        logger.debug(
+            f"Token generation conditions: token_exists={cached_token is not None}, expires_utc={expires_utc}, now_utc={now_utc}"
+        )
+
         try:
             new_token, new_expires = generate_github_app_token(
                 app_id, installation_id, private_key, github_host
@@ -572,10 +582,14 @@ def get_or_refresh_github_app_token(installation_id, github_host="api.github.com
             return new_token
         except Exception as e:
             _record_token_refresh_failure(installation_id)
-            logger.error(f"Failed to generate token for installation {installation_id}: {str(e)}")
+            logger.error(
+                f"Failed to generate token for installation {installation_id}: {str(e)}"
+            )
             raise
     else:
-        logger.debug(f"Using cached token for installation {installation_id}, expires at: {cached_expires}")
+        logger.debug(
+            f"Using cached token for installation {installation_id}, expires at: {cached_expires}"
+        )
         return cached_token
 
 
@@ -587,19 +601,23 @@ def validate_github_app_token(token, github_host="api.github.com"):
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": f"github-backup/{VERSION}",
         }
-        
+
         # Test with rate limit endpoint
         request = Request(f"https://{github_host}/rate_limit", headers=headers)
         response = urlopen(request, context=https_ctx)
-        
+
         if response.getcode() == 200:
             data = json.loads(response.read().decode("utf-8"))
-            logger.debug(f"Token validation successful. Rate limit: {data.get('rate', {}).get('remaining', 'unknown')} remaining")
+            logger.debug(
+                f"Token validation successful. Rate limit: {data.get('rate', {}).get('remaining', 'unknown')} remaining"
+            )
             return True
         else:
-            logger.error(f"Token validation failed with status code: {response.getcode()}")
+            logger.error(
+                f"Token validation failed with status code: {response.getcode()}"
+            )
             return False
-            
+
     except Exception as e:
         logger.error(f"Token validation failed: {str(e)}")
         return False
@@ -683,11 +701,13 @@ def get_github_repo_url(args, repository):
     # Get installation context (required for multi-installation mode)
     installation_id = repository.get("_installation_id")
     if not installation_id:
-        raise Exception(f"Repository {repository.get('full_name', 'unknown')} missing installation context")
-    
+        raise Exception(
+            f"Repository {repository.get('full_name', 'unknown')} missing installation context"
+        )
+
     # Get authentication for this installation
     auth = get_auth(args, installation_id, encode=False, for_git_cli=True)
-    
+
     # Build HTTPS clone URL with authentication
     repo_url = "https://{0}@{1}/{2}/{3}.git".format(
         auth,
@@ -695,7 +715,7 @@ def get_github_repo_url(args, repository):
         repository["owner"]["login"],
         repository["name"],
     )
-    
+
     return repo_url
 
 
@@ -715,7 +735,9 @@ def retrieve_data_gen(
 
         # Always get fresh auth before each API call - this handles token refresh automatically
         auth = get_auth(args, installation_id, encode=False)
-        logger.debug(f"Using installation token for installation {installation_id} for API request to {template}")
+        logger.debug(
+            f"Using installation token for installation {installation_id} for API request to {template}"
+        )
 
         request = _construct_request(
             request_per_page,
@@ -753,13 +775,15 @@ def retrieve_data_gen(
                     limit_remaining, args.throttle_pause
                 )
             )
-            
+
             # Clear cached tokens during throttling to prevent expiration during pause
             if _github_app_credentials is not None:
-                logger.info("Throttling active, clearing cached tokens to prevent expiration during pause")
+                logger.info(
+                    "Throttling active, clearing cached tokens to prevent expiration during pause"
+                )
                 global _github_app_tokens
                 _github_app_tokens.clear()
-            
+
             time.sleep(args.throttle_pause)
 
         retries = 0
@@ -767,10 +791,10 @@ def retrieve_data_gen(
             logger.warning("API request failed. Retrying in 5 seconds")
             retries += 1
             time.sleep(5)
-            
+
             # Get fresh auth for retry - this will automatically handle token refresh if needed
             auth = get_auth(args, installation_id, encode=False)
-            
+
             request = _construct_request(
                 per_page,
                 page,
@@ -801,26 +825,36 @@ def retrieve_data_gen(
             error_details = ""
             required_permissions = ""
             try:
-                if hasattr(r, 'read'):
+                if hasattr(r, "read"):
                     response_body = r.read().decode("utf-8")
                     if response_body:
                         error_data = json.loads(response_body)
                         if "message" in error_data:
                             error_details = f" - {error_data['message']}"
                         if "documentation_url" in error_data:
-                            error_details += f" (See: {error_data['documentation_url']})"
-                        
+                            error_details += (
+                                f" (See: {error_data['documentation_url']})"
+                            )
+
                         # Check for required permissions header
-                        if hasattr(r, 'headers'):
-                            required_perms = r.headers.get('X-Accepted-GitHub-Permissions', '')
+                        if hasattr(r, "headers"):
+                            required_perms = r.headers.get(
+                                "X-Accepted-GitHub-Permissions", ""
+                            )
                             if required_perms:
-                                required_permissions = f" Required permissions: {required_perms}"
+                                required_permissions = (
+                                    f" Required permissions: {required_perms}"
+                                )
             except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
                 # If we can't parse the error response, just use the basic info
                 pass
-            
+
             template = "API request returned HTTP {0}: {1}{2}{3}"
-            errors.append(template.format(status_code, r.reason, error_details, required_permissions))
+            errors.append(
+                template.format(
+                    status_code, r.reason, error_details, required_permissions
+                )
+            )
             raise Exception(", ".join(errors))
 
         if read_error:
@@ -879,7 +913,7 @@ def _get_response(request, auth, template, args=None):
     errors = []
     retry_count = 0
     max_retries = 10  # Maximum number of retries to prevent infinite loops
-    
+
     # We'll make requests in a loop so we can
     # delay and retry in the case of rate-limiting
     while retry_count < max_retries:
@@ -891,11 +925,11 @@ def _get_response(request, auth, template, args=None):
                 exc, auth, errors, args
             )  # noqa
             r = exc
-            
+
             # For 401 errors, we've already cleared cached tokens and attempted to generate new ones
             # The retry will use the fresh token generation mechanism in get_auth()
             # No need for complex request header manipulation here
-                    
+
         except URLError as e:
             logger.warning(e.reason)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
@@ -910,15 +944,19 @@ def _get_response(request, auth, template, args=None):
         if should_continue:
             retry_count += 1
             if retry_count >= max_retries:
-                logger.error(f"Maximum retry limit ({max_retries}) reached for {template}. Stopping to prevent infinite loop.")
+                logger.error(
+                    f"Maximum retry limit ({max_retries}) reached for {template}. Stopping to prevent infinite loop."
+                )
                 break
             continue
 
         break
-    
+
     if retry_count >= max_retries:
-        raise Exception(f"Request failed after {max_retries} retries for {template}. This may indicate a persistent issue with authentication or network connectivity.")
-    
+        raise Exception(
+            f"Request failed after {max_retries} retries for {template}. This may indicate a persistent issue with authentication or network connectivity."
+        )
+
     return r, errors
 
 
@@ -971,14 +1009,16 @@ def _request_http_error(exc, auth, errors, args=None):
             # since we don't know which specific installation token expired
             global _github_app_tokens, _token_refresh_failures, _token_refresh_failure_times
             _github_app_tokens.clear()  # Clear all cached tokens
-            
+
             # Also clear failure tracking since we're forcing a refresh
             _token_refresh_failures.clear()
             _token_refresh_failure_times.clear()
 
             # Clear cached tokens - the next request will generate fresh tokens as needed
             # This is simpler and more reliable than trying to pre-generate tokens here
-            logger.info("Cleared cached tokens, will generate fresh token on next request")
+            logger.info(
+                "Cleared cached tokens, will generate fresh token on next request"
+            )
             should_continue = True
         except Exception as e:
             logger.error(f"Error refreshing GitHub App token: {str(e)}")
@@ -1008,7 +1048,9 @@ def _request_http_error(exc, auth, errors, args=None):
         # Always clear cached tokens when hitting rate limits to prevent using expired tokens after the wait
         # GitHub App tokens expire after 1 hour, so any significant wait could cause expiration
         if _github_app_credentials is not None:
-            logger.info("Rate limit hit, clearing cached tokens to prevent expiration during wait")
+            logger.info(
+                "Rate limit hit, clearing cached tokens to prevent expiration during wait"
+            )
             _github_app_tokens.clear()
 
         time.sleep(delta)
@@ -1143,7 +1185,10 @@ def collect_backup_plan(args):
         try:
             # Generate token for this installation
             token, expires_at = generate_github_app_token(
-                args.app_id, installation_id, args.private_key, get_github_api_host(args)
+                args.app_id,
+                installation_id,
+                args.private_key,
+                get_github_api_host(args),
             )
 
             # Get repositories for this installation
@@ -1283,11 +1328,12 @@ def retrieve_repositories_from_installation(args, installation_id, token=None):
 def apply_repository_filters(args, repositories):
     """Apply all repository filters (name regex, languages, exclude) to repositories."""
     filtered_repos = repositories
-    
+
     # Apply repository name filter
     if args.repository:
         filtered_repos = [
-            r for r in filtered_repos 
+            r
+            for r in filtered_repos
             if r.get("name") == args.repository or r.get("full_name") == args.repository
         ]
 
@@ -1461,7 +1507,9 @@ def backup_issues(args, repo_cwd, repository, repos_template):
     if issues_skipped:
         issues_skipped_message = " (skipped {0} pull requests)".format(issues_skipped)
 
-    logger.info(f"Saving {len(list(issues.keys()))} issues to disk{issues_skipped_message}")
+    logger.info(
+        f"Saving {len(list(issues.keys()))} issues to disk{issues_skipped_message}"
+    )
     comments_template = _issue_template + "/{0}/comments"
     events_template = _issue_template + "/{0}/events"
     for number, issue in list(issues.items()):
@@ -1624,9 +1672,7 @@ def backup_milestones(args, repo_cwd, repository, repos_template):
     query_args = {"state": "all"}
 
     installation_id = repository.get("_installation_id")
-    _milestones = retrieve_data(
-        args, template, installation_id, query_args=query_args
-    )
+    _milestones = retrieve_data(args, template, installation_id, query_args=query_args)
 
     milestones = {}
     for milestone in _milestones:
@@ -1662,13 +1708,13 @@ def backup_hooks(args, repo_cwd, repository, repos_template):
     hook_cwd = os.path.join(repo_cwd, "hooks")
     output_file = "{0}/hooks.json".format(hook_cwd)
     template = "{0}/{1}/hooks".format(repos_template, repository["full_name"])
-    
+
     # Log installation context for debugging
     account_type = repository.get("_account_type", "unknown")
     account_login = repository.get("_account_login", "unknown")
     repo_name = repository.get("full_name", "unknown")
     repo_private = repository.get("private", False)
-    
+
     try:
         _backup_data(
             args,
@@ -1742,9 +1788,7 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
 
         if include_assets:
             installation_id = repository.get("_installation_id")
-            assets = retrieve_data(
-                args, release["assets_url"], installation_id
-            )
+            assets = retrieve_data(args, release["assets_url"], installation_id)
             if len(assets) > 0:
                 # give release asset files somewhere to live & download them (not including source archives)
                 release_assets_cwd = os.path.join(release_cwd, release_name_safe)
@@ -1843,9 +1887,7 @@ def backup_account(args, output_directory):
     account_cwd = os.path.join(output_directory, "account")
 
 
-def _backup_data(
-    args, name, template, output_file, output_directory, installation_id
-):
+def _backup_data(args, name, template, output_file, output_directory, installation_id):
     skip_existing = args.skip_existing
     if not skip_existing or not os.path.exists(output_file):
         logger.info(f"Retrieving {name}")
