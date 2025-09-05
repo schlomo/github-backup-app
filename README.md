@@ -201,7 +201,7 @@ uv sync --dev
 
 ### Available Commands
 
-First, activate the virtual environment:
+First, activate the virtual environment (recommended for less typing):
 ```bash
 source .venv/bin/activate
 ```
@@ -212,6 +212,7 @@ flake8 github_backup/                 # Run linting
 black github_backup/                  # Format code
 black --check github_backup/          # Check formatting
 python -c "import github_backup; print('Import successful')"  # Test import
+github-backup --help                  # Show CLI help
 uv build                              # Build package
 ```
 
