@@ -13,26 +13,46 @@ This application creates comprehensive backups of GitHub repositories and their 
 - **Organized Storage**: Data is organized by account/repository structure
 - **GitHub App Authentication**: Uses modern GitHub App authentication for secure, automated access
 
+## Quick Start
+
+### Docker Quick Start (Recommended)
+
+The fastest way to get started is with Docker:
+
+```bash
+# 1. Create GitHub App
+mkdir -p ./creds
+docker run --rm -it \
+  --entrypoint github-backup-create-app \
+  -u $(id -u):$(id -g) \
+  -p 3000:3000 \
+  -v "$(pwd)/creds:/creds" \
+  ghcr.io/schlomo/github-backup-app:latest \
+  /creds
+```
+This will:
+1. Start a web server on port 3000
+2. You'll need to open your browser to [http://localhost:3000](http://localhost:3000) to access the app creation interface
+3. Guide you through creating a GitHub App
+4. Save credentials to the `./creds` directory
+
+```bash
+# 2. Run backup
+mkdir -p ./backup
+docker run --rm -it \
+  -u $(id -u):$(id -g) \
+  -v "$(pwd)/backup:/data" \
+  -v "$(pwd)/creds:/creds:ro" \
+  ghcr.io/schlomo/github-backup-app:latest \
+  --app-id $(cat ./creds/*-app-id.txt) \
+  --private-key ./creds/$(ls ./creds/*-private-key.pem | head -1 | xargs basename) \
+  --all \
+  --output-directory /data
+```
+
 ## Installation
 
 NOTE: Publication on PyPI is coming soon. Till then you have to install it manually.
-
-### Using uv (Recommended)
-
-```bash
-# Install uv if you haven't already
-brew install uv  # On macOS
-# or: curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install the application (once published on PyPI)
-uv tool install github-backup-app
-```
-
-### Using pip
-
-```bash
-pip install github-backup-app
-```
 
 ### Manual Installation with uv from GitHub
 
@@ -47,8 +67,6 @@ uv venv
 source .venv/bin/activate
 uv pip install https://github.com/schlomo/github-backup-app
 ```
-
-## Quick Start
 
 ### 1. Create a GitHub App
 
@@ -85,7 +103,16 @@ Take note of the App ID and private key. You will need them to run a backup.
 
 For detailed automation instructions, see [scripts/README.md](scripts/README.md).
 
-### 2. Run a Backup
+### 2. Dry Run (See What Would Be Backed Up)
+
+```bash
+github-backup \
+  --app-id YOUR_APP_ID \
+  --private-key /path/to/your-app.pem \
+  --dry-run
+```
+
+### 3. Run a Backup
 
 ```bash
 # Basic backup of all repositories from all installations
@@ -104,16 +131,9 @@ github-backup \
   myorg myuser
 ```
 
-### 3. Dry Run (See What Would Be Backed Up)
-
-```bash
-github-backup \
-  --app-id YOUR_APP_ID \
-  --private-key /path/to/your-app.pem \
-  --dry-run
-```
-
 ## GitHub App Setup
+
+NOTE: You can choose between *Public* and *Private* GitHub Apps. *Public* GitHub Apps are visible to the public and can be installed by anyone. *Private* GitHub Apps are only visible to the organization or user account that owns them and can only be installed by that organization or user account. If you choose *Public* GitHub Apps, you need to be careful with the organization filtering to avoid backing up unintended orgs as anybody can install your app. If you don't choose an organization filtering, the app will backup all orgs and users it has access to.
 
 ### Required Permissions
 
@@ -181,7 +201,7 @@ uv sync --dev
 
 ### Available Commands
 
-First, activate the virtual environment:
+First, activate the virtual environment (recommended for less typing):
 ```bash
 source .venv/bin/activate
 ```
@@ -190,8 +210,8 @@ Then you can use the tools directly:
 ```bash
 flake8 github_backup/                 # Run linting
 black github_backup/                  # Format code
-black --check github_backup/          # Check formatting
 python -c "import github_backup; print('Import successful')"  # Test import
+github-backup --help                  # Show CLI help
 uv build                              # Build package
 ```
 
