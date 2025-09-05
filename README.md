@@ -210,7 +210,6 @@ Then you can use the tools directly:
 ```bash
 flake8 github_backup/                 # Run linting
 black github_backup/                  # Format code
-black --check github_backup/          # Check formatting
 python -c "import github_backup; print('Import successful')"  # Test import
 github-backup --help                  # Show CLI help
 uv build                              # Build package
