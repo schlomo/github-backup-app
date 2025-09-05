@@ -27,7 +27,7 @@ logging.basicConfig(
 
 def main():
     args = parse_args()
-    
+
     # Set logging level based on arguments
     if args.quiet:
         logger.setLevel(logging.WARNING)
@@ -41,7 +41,7 @@ def main():
         # Default to INFO level
         logger.setLevel(logging.INFO)
         logger.root.setLevel(logging.INFO)
-    
+
     try:
         validate_args(args)
 
