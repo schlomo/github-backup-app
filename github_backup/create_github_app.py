@@ -54,7 +54,12 @@ def generate_app_name(username: str) -> str:
     return clean_username[:34]
 
 
-current_username = getpass.getuser()
+try:
+    current_username = getpass.getuser()
+except Exception as e:
+    print(f"❌ Error getting username: {e}")
+    current_username = "unknown"
+
 default_app_name = generate_app_name(current_username)
 
 
