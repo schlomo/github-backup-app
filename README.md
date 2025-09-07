@@ -46,7 +46,7 @@ docker run --rm -it \
   -v "$(pwd)/creds:/creds:ro" \
   ghcr.io/schlomo/github-backup-app:latest \
   --app-id $(cat ./creds/*-app-id.txt) \
-  --private-key ./creds/$(ls ./creds/*-private-key.pem | head -1 | xargs basename) \
+  --private-key /creds/$(ls ./creds/*-private-key.pem | head -1 | xargs basename) \
   --all \
   --output-directory /data
 ```
