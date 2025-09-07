@@ -28,6 +28,7 @@ docker run --rm -it \
   -p 3000:3000 \
   -v "$(pwd)/creds:/creds" \
   ghcr.io/schlomo/github-backup-app:latest \
+  --host 0.0.0.0 \
   /creds
 ```
 This will:
