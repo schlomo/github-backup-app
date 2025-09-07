@@ -756,6 +756,9 @@ from your OS username. You can change this in the web interface if desired.
         help="Directory to save the app credentials (App ID, private key, client secret)",
     )
     parser.add_argument(
+        "--host", default="127.0.0.1", help="Host to bind to (default: localhost)"
+    )
+    parser.add_argument(
         "--port", type=int, default=3000, help="Port for the web server (default: 3000)"
     )
 
@@ -800,7 +803,7 @@ from your OS username. You can change this in the web interface if desired.
         # Use Werkzeug directly to avoid Flask startup messages
         from werkzeug.serving import make_server
 
-        server = make_server("localhost", args.port, app, threaded=True)
+        server = make_server(args.host, args.port, app, threaded=True)
         server.serve_forever()
 
     except KeyboardInterrupt:

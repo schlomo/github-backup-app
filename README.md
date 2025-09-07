@@ -28,6 +28,7 @@ docker run --rm -it \
   -p 3000:3000 \
   -v "$(pwd)/creds:/creds" \
   ghcr.io/schlomo/github-backup-app:latest \
+  --host 0.0.0.0 \
   /creds
 ```
 This will:
@@ -45,7 +46,7 @@ docker run --rm -it \
   -v "$(pwd)/creds:/creds:ro" \
   ghcr.io/schlomo/github-backup-app:latest \
   --app-id $(cat ./creds/*-app-id.txt) \
-  --private-key ./creds/$(ls ./creds/*-private-key.pem | head -1 | xargs basename) \
+  --private-key /creds/$(ls ./creds/*-private-key.pem | head -1 | xargs basename) \
   --all \
   --output-directory /data
 ```
