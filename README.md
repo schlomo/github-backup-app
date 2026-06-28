@@ -57,7 +57,7 @@ NOTE: Publication on PyPI is not planned, please use the Docker image instead or
 
 ### Manual Installation with uv from GitHub
 
-If the package is not yet published on PyPI, you can install it directly from the GitHub repository using [uv](https://github.com/astral-sh/uv):
+You can install it directly from the GitHub repository using [uv](https://github.com/astral-sh/uv):
 
 ```bash
 # Install from GitHub repository
