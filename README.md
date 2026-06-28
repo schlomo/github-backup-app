@@ -53,7 +53,7 @@ docker run --rm -it \
 
 ## Installation
 
-NOTE: Publication on PyPI is coming soon. Till then you have to install it manually.
+NOTE: Publication on PyPI is not planned, please use the Docker image instead or run your own build & delivery to where you need the package.
 
 ### Manual Installation with uv from GitHub
 
