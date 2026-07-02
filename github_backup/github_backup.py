@@ -18,7 +18,7 @@ import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote as urlquote
@@ -35,6 +35,13 @@ except ImportError:
     )
 
 try:
+    import requests
+except ImportError:
+    raise ImportError(
+        "requests library is required. Install it with: pip install requests>=2.34.0"
+    )
+
+try:
     from . import __version__
 
     VERSION = __version__
@@ -43,7 +50,642 @@ except ImportError:
 
 FNULL = open(os.devnull, "w")
 FILE_URI_PREFIX = "file://"
+STATUS_FILENAME = "status.json"
+REPO_METADATA_FILENAME = "repo.json"
+PROJECT_URL = "https://github.com/schlomo/github-backup-app"
 logger = logging.getLogger(__name__)
+
+_github_http_session = None
+
+
+class _HttpResponse:
+    """Adapter so requests responses match the urllib interface used elsewhere."""
+
+    def __init__(self, response):
+        self._response = response
+        self._body = None
+
+    def getcode(self):
+        return self._response.status_code
+
+    @property
+    def headers(self):
+        return self._response.headers
+
+    def read(self):
+        if self._body is None:
+            self._body = self._response.content
+        return self._body
+
+
+class _HttpErrorResponse:
+    """Adapter so requests error responses work with ``_request_http_error``."""
+
+    def __init__(self, response):
+        self._response = response
+        self.code = response.status_code
+        self.reason = response.reason
+        self.headers = response.headers
+
+    def read(self):
+        return self._response.content
+
+
+def get_github_http_session():
+    """Return a shared ``requests.Session`` for GitHub API calls (keep-alive)."""
+    global _github_http_session
+    if _github_http_session is None:
+        _github_http_session = requests.Session()
+    return _github_http_session
+
+
+def close_github_http_session():
+    """Close the shared HTTP session (called at process exit)."""
+    global _github_http_session
+    if _github_http_session is not None:
+        _github_http_session.close()
+        _github_http_session = None
+
+
+def format_exception(exc):
+    """Return a detailed, log-friendly description of an exception.
+
+    Plain ``str(exc)`` often hides the exception type and, for HTTP failures,
+    the response body that GitHub fills with a precise error message. Surfacing
+    both makes failures understandable from the logs alone.
+    """
+    description = f"{type(exc).__name__}: {exc}"
+
+    # urllib's HTTPError behaves like a response object and carries the body
+    # GitHub returns (usually JSON with a "message" field explaining the error).
+    if isinstance(exc, HTTPError):
+        details = [f"HTTP {exc.code} {exc.reason}"]
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            details.append(f"response body: {body}")
+        description = f"{description} ({'; '.join(details)})"
+
+    # Preserve the chained/original cause when one exists.
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        description = f"{description} [caused by {type(cause).__name__}: {cause}]"
+
+    return description
+
+
+def _package_version(name):
+    """Best-effort lookup of an installed package version."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return "not-installed"
+    except Exception:
+        return "unknown"
+
+
+def log_runtime_environment():
+    """Log Python and key dependency versions.
+
+    Dependency drift between environments (e.g. the pinned local install vs. a
+    freshly built container) is a common and hard-to-spot cause of failures, so
+    we record it up front to make such problems obvious from the logs.
+    """
+    jwt_version = getattr(jwt, "__version__", None) or _package_version("PyJWT")
+    logger.debug(
+        "Runtime: github-backup %s | Python %s | %s | "
+        "PyJWT %s | cryptography %s | requests %s | flask %s",
+        VERSION,
+        platform.python_version(),
+        platform.platform(),
+        jwt_version,
+        _package_version("cryptography"),
+        _package_version("requests"),
+        _package_version("flask"),
+    )
+
+
+def _read_previous_last_success(path):
+    """Return the ``last_success_at`` value from an existing status file.
+
+    Falls back to the previous run's ``finished_at`` if it was itself a success
+    (for status files written before this field existed). Returns ``None`` when
+    no prior success can be determined.
+    """
+    try:
+        with codecs.open(path, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+    except OSError, ValueError:
+        return None
+    if previous.get("last_success_at"):
+        return previous["last_success_at"]
+    if previous.get("status") == "success":
+        return previous.get("finished_at") or previous.get("timestamp")
+    return None
+
+
+def write_status_file(output_directory, status, started_at, stats=None, error=None):
+    """Write a machine-readable status file to the root of the backup directory.
+
+    The file is intended for monitoring: it always contains at least ``status``
+    and ``finished_at`` fields, plus summary statistics about the run. It is
+    written atomically so monitoring never observes a half-written file.
+
+    Returns the path written, or ``None`` if it could not be written.
+    """
+    finished_at = datetime.now(timezone.utc)
+    path = os.path.join(output_directory, STATUS_FILENAME)
+
+    # Carry forward the timestamp of the last fully successful run. This lets a
+    # monitor alert on "the last good backup is too old" even when more recent
+    # runs keep failing - the exact situation that previously went unnoticed
+    # for months.
+    if status == "success":
+        last_success_at = finished_at.isoformat()
+    else:
+        last_success_at = _read_previous_last_success(path)
+
+    status_data = {
+        "status": status,
+        "started_at": started_at.isoformat() if started_at else None,
+        "finished_at": finished_at.isoformat(),
+        "duration_seconds": (
+            round((finished_at - started_at).total_seconds(), 3) if started_at else None
+        ),
+        "last_success_at": last_success_at,
+        "tool": "github-backup-app",
+        "url": PROJECT_URL,
+        "version": VERSION,
+        "python_version": platform.python_version(),
+    }
+    if stats:
+        status_data["summary"] = stats
+    if error is not None:
+        status_data["error"] = error
+
+    tmp_path = path + ".tmp"
+    try:
+        with codecs.open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, ensure_ascii=False, sort_keys=True, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+        logger.info(f"Wrote backup status file: {path} (status={status})")
+        return path
+    except Exception as e:
+        logger.error(f"Failed to write status file {path}: {format_exception(e)}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
+def read_json_field(path, field, default=None):
+    """Return a single top-level field from a JSON file on disk.
+
+    Returns ``default`` if the file is missing, unreadable, not a JSON object,
+    or lacks the field. Used to drive incremental skips directly from the backup
+    data (e.g. a repository's last-seen ``pushed_at`` stored in ``repo.json``)
+    rather than from a separate state file.
+    """
+    try:
+        with codecs.open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError, ValueError:
+        return default
+    if isinstance(data, dict):
+        return data.get(field, default)
+    return default
+
+
+def is_item_unchanged(item_file, api_updated_at, force_full=False):
+    """Return True if the on-disk JSON for an item already covers its latest
+    update, so its (expensive) sub-resources do not need to be re-fetched.
+
+    Compares the ``updated_at`` stored in ``item_file`` against the value from
+    the listing response. GitHub emits ISO-8601 UTC (``...Z``) timestamps, which
+    are lexicographically ordered, so a stored value greater than or equal to
+    the listed value means nothing changed since the last backup.
+
+    Returns False (i.e. "fetch it") when forcing a full backup, when the listing
+    has no ``updated_at``, or when the item has no readable stored copy.
+    """
+    if force_full or not api_updated_at:
+        return False
+    stored = read_json_field(item_file, "updated_at")
+    return stored is not None and stored >= api_updated_at
+
+
+def get_github_graphql_url(args):
+    if args.github_host:
+        return f"https://{args.github_host}/api/graphql"
+    return "https://api.github.com/graphql"
+
+
+def _graphql_timestamp(value):
+    if not value:
+        return None
+    return value.replace("+00:00", "Z")
+
+
+def _graphql_user(node):
+    author = node.get("author") or {}
+    login = author.get("login")
+    if not login:
+        return None
+    return {"login": login}
+
+
+def _graphql_issue_to_rest(node):
+    labels = [
+        {"name": label["name"], "color": label.get("color")}
+        for label in (node.get("labels") or {}).get("nodes", [])
+    ]
+    milestone = node.get("milestone")
+    milestone_data = None
+    if milestone:
+        milestone_data = {
+            "number": milestone.get("number"),
+            "title": milestone.get("title"),
+        }
+    return {
+        "number": node["number"],
+        "title": node.get("title"),
+        "body": node.get("body"),
+        "state": (node.get("state") or "").lower(),
+        "created_at": _graphql_timestamp(node.get("createdAt")),
+        "updated_at": _graphql_timestamp(node.get("updatedAt")),
+        "closed_at": _graphql_timestamp(node.get("closedAt")),
+        "url": node.get("url"),
+        "user": _graphql_user(node),
+        "labels": labels,
+        "milestone": milestone_data,
+        "comments": (node.get("comments") or {}).get("totalCount", 0),
+    }
+
+
+def _graphql_pull_to_rest(node, include_details=False):
+    data = {
+        "number": node["number"],
+        "title": node.get("title"),
+        "body": node.get("body"),
+        "state": (node.get("state") or "").lower(),
+        "created_at": _graphql_timestamp(node.get("createdAt")),
+        "updated_at": _graphql_timestamp(node.get("updatedAt")),
+        "closed_at": _graphql_timestamp(node.get("closedAt")),
+        "merged_at": _graphql_timestamp(node.get("mergedAt")),
+        "url": node.get("url"),
+        "user": _graphql_user(node),
+    }
+    if include_details:
+        data.update(
+            {
+                "additions": node.get("additions"),
+                "deletions": node.get("deletions"),
+                "changed_files": node.get("changedFiles"),
+                "merged": node.get("merged"),
+                "mergeable": node.get("mergeable"),
+                "rebaseable": node.get("rebaseable"),
+                "merge_commit_sha": (node.get("mergeCommit") or {}).get("oid"),
+                "commits": (node.get("commits") or {}).get("totalCount", 0),
+            }
+        )
+    return data
+
+
+def _graphql_milestone_to_rest(node):
+    return {
+        "number": node["number"],
+        "title": node.get("title"),
+        "description": node.get("description"),
+        "state": (node.get("state") or "").lower(),
+        "created_at": _graphql_timestamp(node.get("createdAt")),
+        "updated_at": _graphql_timestamp(node.get("updatedAt")),
+        "closed_at": _graphql_timestamp(node.get("closedAt")),
+        "due_on": node.get("dueOn"),
+        "open_issues": node.get("openIssueCount", 0),
+        "closed_issues": node.get("closedIssueCount", 0),
+    }
+
+
+def _graphql_label_to_rest(node):
+    return {
+        "name": node.get("name"),
+        "color": node.get("color"),
+        "description": node.get("description"),
+    }
+
+
+def _graphql_release_to_rest(node):
+    assets = []
+    for asset in (node.get("releaseAssets") or {}).get("nodes", []):
+        assets.append(
+            {
+                "name": asset.get("name"),
+                "size": asset.get("size"),
+                "updated_at": _graphql_timestamp(asset.get("updatedAt")),
+                "url": asset.get("url"),
+            }
+        )
+    return {
+        "tag_name": node.get("tagName"),
+        "name": node.get("name"),
+        "body": node.get("description"),
+        "created_at": _graphql_timestamp(node.get("createdAt")),
+        "published_at": _graphql_timestamp(node.get("publishedAt")),
+        "updated_at": _graphql_timestamp(
+            node.get("updatedAt") or node.get("publishedAt")
+        ),
+        "prerelease": node.get("isPrerelease", False),
+        "draft": node.get("isDraft", False),
+        "assets": assets,
+        "assets_url": node.get("url"),
+    }
+
+
+def _build_repo_metadata_graphql_query(fetch):
+    parts = []
+    if fetch.get("issues"):
+        parts.append("""
+            issues(
+              first: $issuesFirst
+              after: $issuesAfter
+              states: [OPEN, CLOSED]
+              orderBy: {field: UPDATED_AT, direction: DESC}
+            ) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                number title body state createdAt updatedAt closedAt url
+                author { login }
+                comments { totalCount }
+                labels(first: 100) { nodes { name color } }
+                milestone { number title }
+              }
+            }
+            """)
+    if fetch.get("pulls"):
+        detail_fields = ""
+        if fetch.get("pull_details"):
+            detail_fields = """
+                additions deletions changedFiles merged mergeable rebaseable
+                mergeCommit { oid }
+                commits { totalCount }
+            """
+        parts.append(f"""
+            pullRequests(
+              first: $pullsFirst
+              after: $pullsAfter
+              states: [OPEN, CLOSED, MERGED]
+              orderBy: {{field: UPDATED_AT, direction: DESC}}
+            ) {{
+              pageInfo {{ hasNextPage endCursor }}
+              nodes {{
+                number title body state createdAt updatedAt closedAt mergedAt url
+                author {{ login }}
+                {detail_fields}
+              }}
+            }}
+            """)
+    if fetch.get("milestones"):
+        parts.append("""
+            milestones(
+              first: $milestonesFirst
+              after: $milestonesAfter
+              states: [OPEN, CLOSED]
+              orderBy: {field: DUE_DATE, direction: ASC}
+            ) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                number title description state createdAt updatedAt closedAt dueOn
+                openIssueCount closedIssueCount
+              }
+            }
+            """)
+    if fetch.get("labels"):
+        parts.append("""
+            labels(first: $labelsFirst, after: $labelsAfter, orderBy: {field: NAME, direction: ASC}) {
+              pageInfo { hasNextPage endCursor }
+              nodes { name color description }
+            }
+            """)
+    if fetch.get("releases"):
+        parts.append("""
+            releases(first: $releasesFirst, after: $releasesAfter, orderBy: {field: CREATED_AT, direction: DESC}) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                tagName name description createdAt publishedAt updatedAt
+                isDraft isPrerelease url
+                releaseAssets(first: 100) {
+                  nodes { name size updatedAt url }
+                }
+              }
+            }
+            """)
+
+    variable_defs = ["$owner: String!", "$name: String!"]
+    if fetch.get("issues"):
+        variable_defs.extend(["$issuesFirst: Int!", "$issuesAfter: String"])
+    if fetch.get("pulls"):
+        variable_defs.extend(["$pullsFirst: Int!", "$pullsAfter: String"])
+    if fetch.get("milestones"):
+        variable_defs.extend(["$milestonesFirst: Int!", "$milestonesAfter: String"])
+    if fetch.get("labels"):
+        variable_defs.extend(["$labelsFirst: Int!", "$labelsAfter: String"])
+    if fetch.get("releases"):
+        variable_defs.extend(["$releasesFirst: Int!", "$releasesAfter: String"])
+
+    return (
+        f"query RepoMetadata({', '.join(variable_defs)}) {{\n"
+        f"  repository(owner: $owner, name: $name) {{\n"
+        f"    {' '.join(parts)}\n"
+        f"  }}\n"
+        f"}}"
+    )
+
+
+def execute_graphql(args, query, variables, installation_id):
+    """Run a GraphQL query against the GitHub API using the shared session."""
+    auth = get_auth(args, installation_id, encode=False)
+    headers = {
+        "Authorization": f"Bearer {auth}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"github-backup/{VERSION}",
+    }
+    url = get_github_graphql_url(args)
+    logger.debug(f"GraphQL request to {url}")
+    session = get_github_http_session()
+    response = session.post(
+        url, headers=headers, json={"query": query, "variables": variables}, timeout=120
+    )
+    if response.status_code >= 400:
+        raise Exception(f"GraphQL HTTP {response.status_code}: {response.text.strip()}")
+    payload = response.json()
+    if payload.get("errors"):
+        messages = "; ".join(
+            error.get("message", str(error)) for error in payload["errors"]
+        )
+        raise Exception(f"GraphQL error: {messages}")
+    return payload
+
+
+def fetch_repository_metadata_graphql(args, repository, fetch):
+    """Fetch repository metadata in as few GraphQL round trips as possible.
+
+    ``fetch`` is a dict of booleans: issues, pulls, pull_details, milestones,
+    labels, releases. Returns REST-shaped lists for each requested resource.
+    Hooks are not available via GraphQL and must still be fetched over REST.
+    """
+    if not any(fetch.values()):
+        return {}
+
+    owner = repository["owner"]["login"]
+    name = repository["name"]
+    installation_id = repository.get("_installation_id")
+    query = _build_repo_metadata_graphql_query(fetch)
+
+    results = {
+        "issues": [],
+        "pulls": [],
+        "milestones": [],
+        "labels": [],
+        "releases": [],
+    }
+    cursors = {
+        "issues": None,
+        "pulls": None,
+        "milestones": None,
+        "labels": None,
+        "releases": None,
+    }
+    done = {key: not fetch.get(key) for key in cursors}
+
+    while not all(done.values()):
+        variables = {"owner": owner, "name": name}
+        if fetch.get("issues"):
+            variables["issuesFirst"] = 100
+            variables["issuesAfter"] = cursors["issues"]
+        if fetch.get("pulls"):
+            variables["pullsFirst"] = 100
+            variables["pullsAfter"] = cursors["pulls"]
+        if fetch.get("milestones"):
+            variables["milestonesFirst"] = 100
+            variables["milestonesAfter"] = cursors["milestones"]
+        if fetch.get("labels"):
+            variables["labelsFirst"] = 100
+            variables["labelsAfter"] = cursors["labels"]
+        if fetch.get("releases"):
+            variables["releasesFirst"] = 100
+            variables["releasesAfter"] = cursors["releases"]
+
+        payload = execute_graphql(args, query, variables, installation_id)
+        repo_data = (payload.get("data") or {}).get("repository")
+        if repo_data is None:
+            raise Exception(f"GraphQL could not access repository {owner}/{name}")
+
+        if fetch.get("issues"):
+            connection = repo_data["issues"]
+            results["issues"].extend(
+                _graphql_issue_to_rest(node) for node in connection.get("nodes", [])
+            )
+            if connection["pageInfo"]["hasNextPage"]:
+                cursors["issues"] = connection["pageInfo"]["endCursor"]
+            else:
+                done["issues"] = True
+
+        if fetch.get("pulls"):
+            connection = repo_data["pullRequests"]
+            results["pulls"].extend(
+                _graphql_pull_to_rest(node, fetch.get("pull_details"))
+                for node in connection.get("nodes", [])
+            )
+            if connection["pageInfo"]["hasNextPage"]:
+                cursors["pulls"] = connection["pageInfo"]["endCursor"]
+            else:
+                done["pulls"] = True
+
+        if fetch.get("milestones"):
+            connection = repo_data["milestones"]
+            results["milestones"].extend(
+                _graphql_milestone_to_rest(node) for node in connection.get("nodes", [])
+            )
+            if connection["pageInfo"]["hasNextPage"]:
+                cursors["milestones"] = connection["pageInfo"]["endCursor"]
+            else:
+                done["milestones"] = True
+
+        if fetch.get("labels"):
+            connection = repo_data["labels"]
+            results["labels"].extend(
+                _graphql_label_to_rest(node) for node in connection.get("nodes", [])
+            )
+            if connection["pageInfo"]["hasNextPage"]:
+                cursors["labels"] = connection["pageInfo"]["endCursor"]
+            else:
+                done["labels"] = True
+
+        if fetch.get("releases"):
+            connection = repo_data["releases"]
+            results["releases"].extend(
+                _graphql_release_to_rest(node) for node in connection.get("nodes", [])
+            )
+            if connection["pageInfo"]["hasNextPage"]:
+                cursors["releases"] = connection["pageInfo"]["endCursor"]
+            else:
+                done["releases"] = True
+
+    logger.debug(
+        "GraphQL metadata for %s/%s: %d issues, %d pulls, %d milestones, "
+        "%d labels, %d releases",
+        owner,
+        name,
+        len(results["issues"]),
+        len(results["pulls"]),
+        len(results["milestones"]),
+        len(results["labels"]),
+        len(results["releases"]),
+    )
+    return results
+
+
+def write_repo_metadata(repo_cwd, repository):
+    """Persist the repository metadata object as ``repo.json`` (atomic).
+
+    This serves two purposes:
+
+    1. It is useful backup data in its own right (description, topics,
+       visibility, default branch, archived state, ...).
+    2. Its ``pushed_at`` field is the on-disk signal used to decide whether the
+       next run can skip this repository's git fetch.
+
+    Internal bookkeeping keys (prefixed with ``_``, added during discovery) are
+    stripped so the file contains only GitHub's own data.
+
+    Returns the path written, or ``None`` if it could not be written.
+    """
+    clean = {k: v for k, v in repository.items() if not k.startswith("_")}
+    path = os.path.join(repo_cwd, REPO_METADATA_FILENAME)
+    tmp_path = path + ".tmp"
+    try:
+        mkdir_p(repo_cwd)
+        with codecs.open(tmp_path, "w", encoding="utf-8") as f:
+            json_dump(clean, f)
+        os.replace(tmp_path, path)
+        return path
+    except Exception as e:
+        logger.error(f"Failed to write repo metadata {path}: {format_exception(e)}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return None
+
 
 # Global variables for GitHub App token management
 _github_app_tokens = (
@@ -187,11 +829,14 @@ def parse_args(args=None):
         help="log level to use (default: info, possible levels: debug, info, warning, error, critical)",
     )
     parser.add_argument(
-        "-i",
-        "--incremental",
+        "--force-full",
         action="store_true",
-        dest="incremental",
-        help="incremental backup using files to match last version",
+        dest="force_full",
+        help=(
+            "ignore stored backup data and re-fetch everything: re-fetch every "
+            "repository's git content and every issue/pull/milestone even when "
+            "unchanged since the last backup"
+        ),
     )
 
     parser.add_argument(
@@ -451,7 +1096,9 @@ def generate_github_app_token(
         payload = {
             "iat": now - 60,  # Issued at (1 minute ago to account for clock skew)
             "exp": now + 600,  # Expires in 10 minutes (max allowed)
-            "iss": int(app_id),  # Issuer (GitHub App ID)
+            "iss": str(
+                app_id
+            ),  # Issuer (GitHub App ID); must be a string for PyJWT >= 2.11.0
         }
         # Generate JWT
         jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
@@ -640,7 +1287,9 @@ def discover_github_app_installations(
         payload = {
             "iat": now - 60,  # Issued at (1 minute ago to account for clock skew)
             "exp": now + 600,  # Expires in 10 minutes (max allowed)
-            "iss": int(app_id),  # Issuer (GitHub App ID)
+            "iss": str(
+                app_id
+            ),  # Issuer (GitHub App ID); must be a string for PyJWT >= 2.11.0
         }
 
         # Generate JWT
@@ -671,7 +1320,9 @@ def discover_github_app_installations(
         return installations
 
     except Exception as e:
-        raise Exception(f"Failed to discover GitHub App installations: {str(e)}")
+        raise Exception(
+            f"Failed to discover GitHub App installations: {format_exception(e)}"
+        ) from e
 
 
 def get_github_api_host(args):
@@ -845,7 +1496,7 @@ def retrieve_data_gen(
                                 required_permissions = (
                                     f" Required permissions: {required_perms}"
                                 )
-            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            except json.JSONDecodeError, UnicodeDecodeError, AttributeError:
                 # If we can't parse the error response, just use the basic info
                 pass
 
@@ -913,33 +1564,44 @@ def _get_response(request, auth, template, args=None):
     errors = []
     retry_count = 0
     max_retries = 10  # Maximum number of retries to prevent infinite loops
+    session = get_github_http_session()
 
     # We'll make requests in a loop so we can
     # delay and retry in the case of rate-limiting
     while retry_count < max_retries:
         should_continue = False
         try:
-            r = urlopen(request, context=https_ctx)
-        except HTTPError as exc:
-            errors, should_continue = _request_http_error(
-                exc, auth, errors, args
-            )  # noqa
-            r = exc
-
-            # For 401 errors, we've already cleared cached tokens and attempted to generate new ones
-            # The retry will use the fresh token generation mechanism in get_auth()
-            # No need for complex request header manipulation here
-
-        except URLError as e:
-            logger.warning(e.reason)
+            method = request.get_method() if hasattr(request, "get_method") else "GET"
+            headers = dict(request.header_items())
+            data = getattr(request, "data", None)
+            response = session.request(
+                method,
+                request.full_url,
+                headers=headers,
+                data=data,
+                timeout=120,
+            )
+            if response.status_code >= 400:
+                http_error = _HttpErrorResponse(response)
+                errors, should_continue = _request_http_error(
+                    http_error, auth, errors, args
+                )
+                r = http_error
+            else:
+                r = _HttpResponse(response)
+        except requests.RequestException as e:
+            reason = getattr(e, "args", [str(e)])[0]
+            logger.warning(reason)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
             if not should_continue:
                 raise
+            r = None
         except socket.error as e:
             logger.warning(e.strerror)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
             if not should_continue:
                 raise
+            r = None
 
         if should_continue:
             retry_count += 1
@@ -1375,167 +2037,268 @@ def backup_repositories(args, output_directory, repositories):
     logger.info(f"Number of repositories to backup: {len(repositories)}")
     repos_template = "https://{0}/repos".format(get_github_api_host(args))
 
-    # Incremental backup is now always based on file modification times
+    # Incremental skip is driven entirely by the backup data on disk: each
+    # repository's previous `pushed_at` is read back from its own `repo.json`.
+    # A repository's git content has not changed iff its current `pushed_at`
+    # (from the API list response) equals the stored one, which lets us skip the
+    # (often dominant) git fetch entirely.
+    # NOTE: we deliberately do NOT use the repository's `updated_at` to skip
+    # issues/PRs/etc. - that field only reflects repository *metadata* changes,
+    # not issue/PR/comment activity, so trusting it would silently miss data.
+    total = len(repositories)
+    succeeded = 0
+    git_skipped = 0
+    issues_skipped = 0
+    pulls_skipped = 0
+    milestones_skipped = 0
+    failed_repositories = []
+    accounts = set()
+    interrupted = False
 
-    last_update = "0000-00-00T00:00:00Z"
     for i, repository in enumerate(repositories, 1):
-        logger.info(
-            f"Processing repository {i}/{len(repositories)}: {repository.get('full_name', 'unknown')}"
-        )
+        repo_full_name = repository.get("full_name", "unknown")
+        logger.info(f"Processing repository {i}/{total}: {repo_full_name}")
+
+        # Isolate each repository so a single failure does not abort the
+        # whole run; record the failure so it surfaces in logs and the
+        # status file instead of silently taking down everything else.
         try:
+            owner = repository.get("owner", {}).get("login", "unknown")
+            accounts.add(owner)
+
+            # For repositories, organize by owner as top level
+            repo_cwd = os.path.join(
+                output_directory, owner, "repositories", repository["name"]
+            )
+
+            repo_dir = os.path.join(repo_cwd, "repository")
+            repo_url = get_github_repo_url(args, repository)
+
+            pushed_at = repository.get("pushed_at")
+            stored_pushed_at = read_json_field(
+                os.path.join(repo_cwd, REPO_METADATA_FILENAME), "pushed_at"
+            )
+            git_unchanged = (
+                not args.force_full
+                and pushed_at is not None
+                and stored_pushed_at == pushed_at
+                and os.path.exists(repo_dir)
+            )
+
+            if args.include_repository or args.include_everything:
+                repo_name = repository.get("name")
+                if git_unchanged:
+                    logger.info(
+                        f"Repository {repo_name} unchanged since last backup "
+                        f"(pushed_at={pushed_at}); skipping git fetch"
+                    )
+                    git_skipped += 1
+                else:
+                    logger.info(f"Backing up repository: {repo_name} to {repo_cwd}")
+                    mkdir_p(repo_cwd)
+                    fetch_repository(
+                        repo_name,
+                        repo_url,
+                        repo_dir,
+                        skip_existing=args.skip_existing,
+                        bare_clone=args.bare_clone,
+                        lfs_clone=args.lfs_clone,
+                        no_prune=args.no_prune,
+                    )
+
+            # Wiki edits are NOT reflected in the repository's pushed_at, so the
+            # wiki is always fetched (a no-op when unchanged) to never miss one.
+            download_wiki = args.include_wiki or args.include_everything
+            if repository["has_wiki"] and download_wiki:
+                fetch_repository(
+                    repository["name"],
+                    repo_url.replace(".git", ".wiki.git"),
+                    os.path.join(repo_cwd, "wiki"),
+                    skip_existing=args.skip_existing,
+                    bare_clone=args.bare_clone,
+                    lfs_clone=args.lfs_clone,
+                    no_prune=args.no_prune,
+                )
+
+            fetch_issues = args.include_issues or args.include_everything
+            fetch_pulls = args.include_pulls or args.include_everything
+            fetch_milestones = args.include_milestones or args.include_everything
+            fetch_labels = args.include_labels or args.include_everything
+            fetch_releases = args.include_releases or args.include_everything
+            metadata_bundle = None
             if (
-                "updated_at" in repository
-                and repository["updated_at"] is not None
-                and repository["updated_at"] > last_update
+                fetch_issues
+                or fetch_pulls
+                or fetch_milestones
+                or fetch_labels
+                or fetch_releases
             ):
-                last_update = repository["updated_at"]
-            elif (
-                "pushed_at" in repository
-                and repository["pushed_at"] is not None
-                and repository["pushed_at"] > last_update
-            ):
-                last_update = repository["pushed_at"]
-        except TypeError as e:
-            repo_name = repository.get("name", "unknown")
-            repo_full_name = repository.get("full_name", "unknown")
+                logger.info("Fetching repository metadata via GraphQL")
+                metadata_bundle = fetch_repository_metadata_graphql(
+                    args,
+                    repository,
+                    {
+                        "issues": fetch_issues,
+                        "pulls": fetch_pulls,
+                        "pull_details": args.include_pull_details,
+                        "milestones": fetch_milestones,
+                        "labels": fetch_labels,
+                        "releases": fetch_releases,
+                    },
+                )
+
+            if fetch_issues:
+                issues_skipped += backup_issues(
+                    args,
+                    repo_cwd,
+                    repository,
+                    repos_template,
+                    prefetched_issues=metadata_bundle.get("issues"),
+                )["skipped"]
+
+            if fetch_pulls:
+                pulls_skipped += backup_pulls(
+                    args,
+                    repo_cwd,
+                    repository,
+                    repos_template,
+                    prefetched_pulls=metadata_bundle.get("pulls"),
+                )["skipped"]
+
+            if fetch_milestones:
+                milestones_skipped += backup_milestones(
+                    args,
+                    repo_cwd,
+                    repository,
+                    repos_template,
+                    prefetched_milestones=metadata_bundle.get("milestones"),
+                )["skipped"]
+
+            if fetch_labels:
+                backup_labels(
+                    args,
+                    repo_cwd,
+                    repository,
+                    repos_template,
+                    prefetched_labels=metadata_bundle.get("labels"),
+                )
+
+            if args.include_hooks or args.include_everything:
+                backup_hooks(args, repo_cwd, repository, repos_template)
+
+            if fetch_releases:
+                backup_releases(
+                    args,
+                    repo_cwd,
+                    repository,
+                    repos_template,
+                    include_assets=args.include_assets or args.include_everything,
+                    prefetched_releases=metadata_bundle.get("releases"),
+                )
+
+            # Persist repository metadata as backup data. Its `pushed_at`
+            # becomes the on-disk signal that lets the next run skip this
+            # repo's git fetch while the content stays unchanged. Written
+            # only after a successful pass so a mid-repo failure does not
+            # mark git as up-to-date when it isn't. Because this also runs
+            # when the git fetch was skipped, metadata (description, topics,
+            # ...) stays current every run.
+            write_repo_metadata(repo_cwd, repository)
+
+            succeeded += 1
+        except KeyboardInterrupt:
+            logger.warning(
+                "Interrupted by user (Ctrl-C) while processing "
+                f"'{repo_full_name}'; stopping after {i - 1}/{total} "
+                "repositories. Per-repository progress has been saved."
+            )
+            interrupted = True
+            break
+        except Exception as e:
+            detail = format_exception(e)
             logger.error(
-                f"Error comparing timestamps for repository '{repo_full_name}': {str(e)}. "
-                f"Repository data: updated_at={repository.get('updated_at')}, pushed_at={repository.get('pushed_at')}. "
-                f"Skipping timestamp comparison for this repository."
+                f"Failed to back up repository '{repo_full_name}': {detail}",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
             )
-            # Don't continue - we still want to backup the repository
+            failed_repositories.append({"repository": repo_full_name, "error": detail})
 
-        # Get the owner information
-        owner = repository.get("owner", {}).get("login", "unknown")
-        owner_type = repository.get("owner", {}).get("type", "User")
-
-        # For repositories, organize by owner as top level
-        repo_cwd = os.path.join(
-            output_directory, owner, "repositories", repository["name"]
-        )
-
-        repo_dir = os.path.join(repo_cwd, "repository")
-        repo_url = get_github_repo_url(args, repository)
-
-        if args.include_repository or args.include_everything:
-            repo_name = repository.get("name")
-            logger.info(f"Backing up repository: {repo_name} to {repo_cwd}")
-            mkdir_p(repo_cwd)
-            fetch_repository(
-                repo_name,
-                repo_url,
-                repo_dir,
-                skip_existing=args.skip_existing,
-                bare_clone=args.bare_clone,
-                lfs_clone=args.lfs_clone,
-                no_prune=args.no_prune,
-            )
-
-        download_wiki = args.include_wiki or args.include_everything
-        if repository["has_wiki"] and download_wiki:
-            fetch_repository(
-                repository["name"],
-                repo_url.replace(".git", ".wiki.git"),
-                os.path.join(repo_cwd, "wiki"),
-                skip_existing=args.skip_existing,
-                bare_clone=args.bare_clone,
-                lfs_clone=args.lfs_clone,
-                no_prune=args.no_prune,
-            )
-        if args.include_issues or args.include_everything:
-            backup_issues(args, repo_cwd, repository, repos_template)
-
-        if args.include_pulls or args.include_everything:
-            backup_pulls(args, repo_cwd, repository, repos_template)
-
-        if args.include_milestones or args.include_everything:
-            backup_milestones(args, repo_cwd, repository, repos_template)
-
-        if args.include_labels or args.include_everything:
-            backup_labels(args, repo_cwd, repository, repos_template)
-
-        if args.include_hooks or args.include_everything:
-            backup_hooks(args, repo_cwd, repository, repos_template)
-
-        if args.include_releases or args.include_everything:
-            backup_releases(
-                args,
-                repo_cwd,
-                repository,
-                repos_template,
-                include_assets=args.include_assets or args.include_everything,
-            )
-
-    # No need to write last_update file since incremental backup is now based on file modification times
+    stats = {
+        "installations": len(accounts),
+        "accounts": sorted(accounts),
+        "repositories_total": total,
+        "repositories_succeeded": succeeded,
+        "repositories_failed": len(failed_repositories),
+        "repositories_git_skipped_unchanged": git_skipped,
+        "issues_skipped_unchanged": issues_skipped,
+        "pulls_skipped_unchanged": pulls_skipped,
+        "milestones_skipped_unchanged": milestones_skipped,
+        "failed_repositories": failed_repositories,
+        "interrupted": interrupted,
+    }
+    logger.info(
+        f"Backup complete: {succeeded}/{total} repositories succeeded, "
+        f"{len(failed_repositories)} failed, {git_skipped} git fetches skipped, "
+        f"{issues_skipped} issues + {pulls_skipped} pulls skipped (unchanged)"
+    )
+    return stats
 
 
-def backup_issues(args, repo_cwd, repository, repos_template):
+def backup_issues(args, repo_cwd, repository, repos_template, prefetched_issues=None):
     has_issues_dir = os.path.isdir("{0}/issues/.git".format(repo_cwd))
     if args.skip_existing and has_issues_dir:
-        return
+        return {"total": 0, "skipped": 0}
 
     logger.info("Retrieving issues")
     issue_cwd = os.path.join(repo_cwd, "issues")
     mkdir_p(repo_cwd, issue_cwd)
 
     issues = {}
-    issues_skipped = 0
     issues_skipped_message = ""
     _issue_template = "{0}/{1}/issues".format(repos_template, repository["full_name"])
 
-    should_include_pulls = args.include_pulls or args.include_everything
-    issue_states = ["open", "closed"]
-    for issue_state in issue_states:
-        query_args = {"filter": "all", "state": issue_state}
-
-        installation_id = repository.get("_installation_id")
-        _issues = retrieve_data(
-            args,
-            _issue_template,
-            installation_id,
-            query_args=query_args,
-        )
-        for issue in _issues:
-            # skip pull requests which are also returned as issues
-            # if retrieving pull requests is requested as well
-            if "pull_request" in issue and should_include_pulls:
-                issues_skipped += 1
-                continue
-
+    if prefetched_issues is not None:
+        for issue in prefetched_issues:
             issues[issue["number"]] = issue
+    else:
+        should_include_pulls = args.include_pulls or args.include_everything
+        issues_skipped_pulls = 0
+        issue_states = ["open", "closed"]
+        for issue_state in issue_states:
+            query_args = {"filter": "all", "state": issue_state}
 
-    if issues_skipped:
-        issues_skipped_message = " (skipped {0} pull requests)".format(issues_skipped)
+            installation_id = repository.get("_installation_id")
+            _issues = retrieve_data(
+                args,
+                _issue_template,
+                installation_id,
+                query_args=query_args,
+            )
+            for issue in _issues:
+                if "pull_request" in issue and should_include_pulls:
+                    issues_skipped_pulls += 1
+                    continue
+
+                issues[issue["number"]] = issue
+        if issues_skipped_pulls:
+            issues_skipped_message = " (skipped {0} pull requests)".format(
+                issues_skipped_pulls
+            )
 
     logger.info(
         f"Saving {len(list(issues.keys()))} issues to disk{issues_skipped_message}"
     )
     comments_template = _issue_template + "/{0}/comments"
     events_template = _issue_template + "/{0}/events"
+    skipped = 0
     for number, issue in list(issues.items()):
         issue_file = "{0}/{1}.json".format(issue_cwd, number)
-        if args.incremental and os.path.isfile(issue_file):
-            try:
-                modified = os.path.getmtime(issue_file)
-                modified = datetime.fromtimestamp(modified).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-                if (
-                    issue.get("updated_at") is not None
-                    and modified > issue["updated_at"]
-                ):
-                    logger.info(
-                        "Skipping issue {0} because it wasn't modified since last backup".format(
-                            number
-                        )
-                    )
-                    continue
-            except TypeError as e:
-                logger.error(
-                    f"Error comparing timestamps for issue #{number} in repository '{repository.get('full_name', 'unknown')}': {str(e)}. "
-                    f"Issue data: updated_at={issue.get('updated_at')}. "
-                    f"Continuing with backup of this issue."
-                )
+        # Skip the expensive per-issue comment/event fetches and the rewrite
+        # when the stored copy already reflects this issue's latest update. An
+        # issue's `updated_at` reliably advances on comment/label/state activity.
+        if is_item_unchanged(issue_file, issue.get("updated_at"), args.force_full):
+            logger.debug(f"Skipping unchanged issue #{number}")
+            skipped += 1
+            continue
 
         if args.include_issue_comments or args.include_everything:
             template = comments_template.format(number)
@@ -1556,11 +2319,15 @@ def backup_issues(args, repo_cwd, repository, repos_template):
                 issue_file + ".temp", issue_file
             )  # Unlike json_dump, this is atomic
 
+    if skipped:
+        logger.info(f"Skipped {skipped} unchanged issues")
+    return {"total": len(issues), "skipped": skipped}
 
-def backup_pulls(args, repo_cwd, repository, repos_template):
+
+def backup_pulls(args, repo_cwd, repository, repos_template, prefetched_pulls=None):
     has_pulls_dir = os.path.isdir("{0}/pulls/.git".format(repo_cwd))
     if args.skip_existing and has_pulls_dir:
-        return
+        return {"total": 0, "skipped": 0}
 
     logger.info("Retrieving pull requests")
     pulls_cwd = os.path.join(repo_cwd, "pulls")
@@ -1569,17 +2336,32 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
     pulls = {}
     _pulls_template = "{0}/{1}/pulls".format(repos_template, repository["full_name"])
     _issue_template = "{0}/{1}/issues".format(repos_template, repository["full_name"])
-    query_args = {
-        "filter": "all",
-        "state": "all",
-        "sort": "updated",
-        "direction": "desc",
-    }
 
-    if not args.include_pull_details:
-        pull_states = ["open", "closed"]
-        for pull_state in pull_states:
-            query_args["state"] = pull_state
+    if prefetched_pulls is not None:
+        for pull in prefetched_pulls:
+            pulls[pull["number"]] = pull
+    else:
+        query_args = {
+            "filter": "all",
+            "state": "all",
+            "sort": "updated",
+            "direction": "desc",
+        }
+
+        if not args.include_pull_details:
+            pull_states = ["open", "closed"]
+            for pull_state in pull_states:
+                query_args["state"] = pull_state
+                installation_id = repository.get("_installation_id")
+                _pulls = retrieve_data_gen(
+                    args,
+                    _pulls_template,
+                    installation_id,
+                    query_args=query_args,
+                )
+                for pull in _pulls:
+                    pulls[pull["number"]] = pull
+        else:
             installation_id = repository.get("_installation_id")
             _pulls = retrieve_data_gen(
                 args,
@@ -1588,23 +2370,13 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
                 query_args=query_args,
             )
             for pull in _pulls:
-                pulls[pull["number"]] = pull
-    else:
-        installation_id = repository.get("_installation_id")
-        _pulls = retrieve_data_gen(
-            args,
-            _pulls_template,
-            installation_id,
-            query_args=query_args,
-        )
-        for pull in _pulls:
-            installation_id = repository.get("_installation_id")
-            pulls[pull["number"]] = retrieve_data(
-                args,
-                _pulls_template + "/{}".format(pull["number"]),
-                installation_id,
-                single_request=True,
-            )[0]
+                installation_id = repository.get("_installation_id")
+                pulls[pull["number"]] = retrieve_data(
+                    args,
+                    _pulls_template + "/{}".format(pull["number"]),
+                    installation_id,
+                    single_request=True,
+                )[0]
 
     logger.info(f"Saving {len(list(pulls.keys()))} pull requests to disk")
     # Comments from pulls API are only _review_ comments
@@ -1614,27 +2386,15 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
     comments_regular_template = _issue_template + "/{0}/comments"
     comments_template = _pulls_template + "/{0}/comments"
     commits_template = _pulls_template + "/{0}/commits"
+    skipped = 0
     for number, pull in list(pulls.items()):
         pull_file = "{0}/{1}.json".format(pulls_cwd, number)
-        if args.incremental and os.path.isfile(pull_file):
-            try:
-                modified = os.path.getmtime(pull_file)
-                modified = datetime.fromtimestamp(modified).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-                if pull.get("updated_at") is not None and modified > pull["updated_at"]:
-                    logger.info(
-                        "Skipping pull request {0} because it wasn't modified since last backup".format(
-                            number
-                        )
-                    )
-                    continue
-            except TypeError as e:
-                logger.error(
-                    f"Error comparing timestamps for pull request #{number} in repository '{repository.get('full_name', 'unknown')}': {str(e)}. "
-                    f"Pull request data: updated_at={pull.get('updated_at')}. "
-                    f"Continuing with backup of this pull request."
-                )
+        # Skip the expensive per-PR comment/commit fetches and the rewrite when
+        # the stored copy already reflects this PR's latest update.
+        if is_item_unchanged(pull_file, pull.get("updated_at"), args.force_full):
+            logger.debug(f"Skipping unchanged pull request #{number}")
+            skipped += 1
+            continue
         if args.include_pull_comments or args.include_everything:
             template = comments_regular_template.format(number)
             installation_id = repository.get("_installation_id")
@@ -1658,34 +2418,52 @@ def backup_pulls(args, repo_cwd, repository, repos_template):
                 pull_file + ".temp", pull_file
             )  # Unlike json_dump, this is atomic
 
+    if skipped:
+        logger.info(f"Skipped {skipped} unchanged pull requests")
+    return {"total": len(pulls), "skipped": skipped}
 
-def backup_milestones(args, repo_cwd, repository, repos_template):
+
+def backup_milestones(
+    args, repo_cwd, repository, repos_template, prefetched_milestones=None
+):
     milestone_cwd = os.path.join(repo_cwd, "milestones")
     if args.skip_existing and os.path.isdir(milestone_cwd):
-        return
+        return {"total": 0, "skipped": 0}
 
     logger.info("Retrieving milestones")
     mkdir_p(repo_cwd, milestone_cwd)
 
-    template = "{0}/{1}/milestones".format(repos_template, repository["full_name"])
-
-    query_args = {"state": "all"}
-
-    installation_id = repository.get("_installation_id")
-    _milestones = retrieve_data(args, template, installation_id, query_args=query_args)
+    if prefetched_milestones is not None:
+        _milestones = prefetched_milestones
+    else:
+        template = "{0}/{1}/milestones".format(repos_template, repository["full_name"])
+        query_args = {"state": "all"}
+        installation_id = repository.get("_installation_id")
+        _milestones = retrieve_data(
+            args, template, installation_id, query_args=query_args
+        )
 
     milestones = {}
     for milestone in _milestones:
         milestones[milestone["number"]] = milestone
 
     logger.info(f"Saving {len(list(milestones.keys()))} milestones to disk")
+    skipped = 0
     for number, milestone in list(milestones.items()):
         milestone_file = "{0}/{1}.json".format(milestone_cwd, number)
+        # Milestones have no sub-resources; skip the rewrite when unchanged.
+        if is_item_unchanged(
+            milestone_file, milestone.get("updated_at"), args.force_full
+        ):
+            skipped += 1
+            continue
         with codecs.open(milestone_file, "w", encoding="utf-8") as f:
             json_dump(milestone, f)
 
+    return {"total": len(milestones), "skipped": skipped}
 
-def backup_labels(args, repo_cwd, repository, repos_template):
+
+def backup_labels(args, repo_cwd, repository, repos_template, prefetched_labels=None):
     label_cwd = os.path.join(repo_cwd, "labels")
     output_file = "{0}/labels.json".format(label_cwd)
     template = "{0}/{1}/labels".format(repos_template, repository["full_name"])
@@ -1697,6 +2475,7 @@ def backup_labels(args, repo_cwd, repository, repos_template):
         output_file,
         label_cwd,
         installation_id,
+        prefetched=prefetched_labels,
     )
 
 
@@ -1743,7 +2522,14 @@ def backup_hooks(args, repo_cwd, repository, repos_template):
             raise e
 
 
-def backup_releases(args, repo_cwd, repository, repos_template, include_assets=False):
+def backup_releases(
+    args,
+    repo_cwd,
+    repository,
+    repos_template,
+    include_assets=False,
+    prefetched_releases=None,
+):
     repository_fullname = repository["full_name"]
 
     # give release files somewhere to live & log intent
@@ -1751,13 +2537,14 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
     logger.info("Retrieving releases")
     mkdir_p(repo_cwd, release_cwd)
 
-    query_args = {}
-
-    release_template = "{0}/{1}/releases".format(repos_template, repository_fullname)
-    installation_id = repository.get("_installation_id")
-    releases = retrieve_data(
-        args, release_template, installation_id, query_args=query_args
-    )
+    if prefetched_releases is not None:
+        releases = prefetched_releases
+    else:
+        release_template = "{0}/{1}/releases".format(
+            repos_template, repository_fullname
+        )
+        installation_id = repository.get("_installation_id")
+        releases = retrieve_data(args, release_template, installation_id, query_args={})
 
     if args.skip_prerelease:
         releases = [r for r in releases if not r["prerelease"] and not r["draft"]]
@@ -1788,7 +2575,9 @@ def backup_releases(args, repo_cwd, repository, repos_template, include_assets=F
 
         if include_assets:
             installation_id = repository.get("_installation_id")
-            assets = retrieve_data(args, release["assets_url"], installation_id)
+            assets = release.get("assets")
+            if assets is None:
+                assets = retrieve_data(args, release["assets_url"], installation_id)
             if len(assets) > 0:
                 # give release asset files somewhere to live & download them (not including source archives)
                 release_assets_cwd = os.path.join(release_cwd, release_name_safe)
@@ -1887,9 +2676,24 @@ def backup_account(args, output_directory):
     account_cwd = os.path.join(output_directory, "account")
 
 
-def _backup_data(args, name, template, output_file, output_directory, installation_id):
+def _backup_data(
+    args,
+    name,
+    template,
+    output_file,
+    output_directory,
+    installation_id,
+    prefetched=None,
+):
     skip_existing = args.skip_existing
     if not skip_existing or not os.path.exists(output_file):
+        if prefetched is not None:
+            logger.info(f"Writing {len(prefetched)} {name} to disk")
+            mkdir_p(output_directory)
+            with codecs.open(output_file, "w", encoding="utf-8") as f:
+                json_dump(prefetched, f)
+            return
+
         logger.info(f"Retrieving {name}")
         mkdir_p(output_directory)
         data = retrieve_data(args, template, installation_id)

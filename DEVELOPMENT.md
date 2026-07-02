@@ -4,7 +4,7 @@ This guide will help you set up a development environment for the `github-backup
 
 ## Prerequisites
 
-- Python 3.12+ (tested with Python 3.13.3)
+- Python 3.14+ (tested with Python 3.14.6)
 - Git
 - [uv](https://github.com/astral-sh/uv) (fast Python package manager)
 
@@ -113,16 +113,13 @@ black --check github_backup/
 github-backup-app/
 ├── github_backup/                   # Main package
 │   ├── __init__.py                  # Package initialization
+│   ├── __main__.py                  # Backup tool CLI entry point
 │   ├── github_backup.py             # Main application logic
 │   └── create_github_app.py         # Script to automate creation of a GitHub App
-├── bin/                             # Executable scripts
-│   ├── github-backup                # Backup tool CLI entry point
-│   └── github-backup-create-app     # GitHub App creation CLI entry poing
 ├── .github/
 │   └── workflows/                   # GitHub Actions CI/CD
-│       ├── ci.yml                   # Continuous Integration
-│       ├── docker.yml               # Docker build and push
-│       └── release.yml              # Release automation
+│       └── ci-cd.yml                # Test, build, Docker and PyPI release
+├── Dockerfile                       # Container image definition
 ├── pyproject.toml                   # Modern Python packaging configuration
 ├── uv.lock                          # Dependency lock file
 ├── dev-setup.sh                     # Development setup script
@@ -153,11 +150,8 @@ github-backup username --app-id YOUR_APP_ID --private-key YOUR_PRIVATE_KEY --out
 # Activate the virtual environment first
 source .venv/bin/activate
 
-# Run directly from source
-python bin/github-backup --help
-
-# Run the main module
-python -m github_backup.github_backup --help
+# Run directly from source as a module
+python -m github_backup --help
 
 # Use the installed command
 github-backup --help
@@ -176,3 +170,15 @@ github-backup --help
 9. Submit a pull request
 
 The CI/CD pipeline will automatically run tests, linting, and formatting checks on your pull request.
+
+### Cutting a release
+
+```bash
+# 1. Bump __version__ in github_backup/__init__.py
+# 2. Commit, merge to main (updates :latest Docker image)
+# 3. Tag for PyPI + semver Docker tags:
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Ensure `PYPI_API_TOKEN` is configured under repository Secrets before tagging, or the PyPI job will fail (Docker will still publish).

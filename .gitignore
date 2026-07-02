@@ -44,8 +44,7 @@ README
 id_rsa
 id_rsa.pub
 
-# Virtual env
-venv
+# Virtual env (this project uses .venv, managed by uv)
 .venv
 
 # test content

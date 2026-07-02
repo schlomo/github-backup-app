@@ -1,24 +1,29 @@
-FROM python:3.13-alpine3.22 AS builder
+FROM python:3.14-alpine AS builder
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir uv
 
 WORKDIR /app
 
-# Copy dependency files first for better caching
+# Copy dependency files first for better layer caching
 COPY pyproject.toml uv.lock ./
 
-# Create virtual environment and install dependencies
-RUN --mount=type=cache,target=/root/.cache/uv uv venv
+# Install locked dependencies into the project virtualenv. Using the lock file
+# (instead of `uv pip install .`) guarantees the image ships the exact same
+# dependency versions that were tested, preventing silent breakage when an
+# upstream release changes behaviour (e.g. PyJWT 2.11 requiring a string `iss`).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
 
-# Copy source code
+# Copy source code and install the project itself. --no-editable builds and
+# installs the package into the virtualenv (rather than linking back to /app,
+# which does not exist in the final image stage).
 COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
 
-# Install the package in development mode to include all files
-RUN --mount=type=cache,target=/root/.cache/uv uv pip install .
 
-
-FROM python:3.13-alpine3.22
+FROM python:3.14-alpine
 ENV PYTHONUNBUFFERED=1
 
 RUN apk add --no-cache \

@@ -3,18 +3,23 @@
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 from github_backup.github_backup import (
     backup_repositories,
     check_git_lfs_install,
+    close_github_http_session,
     collect_backup_plan,
     filter_repositories,
+    format_exception,
     get_github_api_host,
+    log_runtime_environment,
     logger,
     mkdir_p,
     parse_args,
     retrieve_repositories,
     validate_args,
+    write_status_file,
 )
 
 # Set up logging with DEBUG level initially to capture all messages
@@ -41,6 +46,11 @@ def main():
         # Default to INFO level
         logger.setLevel(logging.INFO)
         logger.root.setLevel(logging.INFO)
+
+    log_runtime_environment()
+
+    started_at = datetime.now(timezone.utc)
+    output_directory = None
 
     try:
         validate_args(args)
@@ -105,7 +115,34 @@ def main():
         # Starred gists are now handled per installation during auto-discovery
 
         repositories = filter_repositories(args, repositories)
-        backup_repositories(args, output_directory, repositories)
+        stats = backup_repositories(args, output_directory, repositories)
+
+        if stats.get("interrupted"):
+            write_status_file(output_directory, "interrupted", started_at, stats=stats)
+            logger.warning("Backup interrupted by user; partial progress saved.")
+            sys.exit(130)
+
+        # A run is "partial" when some repositories failed but the run itself
+        # completed; this distinction is useful for monitoring/alerting.
+        status = "partial" if stats.get("repositories_failed") else "success"
+        write_status_file(output_directory, status, started_at, stats=stats)
+
+        if status == "partial":
+            logger.warning(
+                "Backup finished with errors: "
+                f"{stats['repositories_failed']} repository(ies) failed. "
+                "See the status file and logs above for details."
+            )
+            sys.exit(2)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user (Ctrl-C). Aborting.")
+        _write_failure_status(
+            output_directory,
+            started_at,
+            KeyboardInterrupt("Interrupted by user"),
+            status="interrupted",
+        )
+        sys.exit(130)
     except TypeError as e:
         if "not supported between instances of 'NoneType' and 'str'" in str(e):
             logger.error(
@@ -113,14 +150,38 @@ def main():
                 f"This error typically occurs when GitHub API returns None values for timestamp fields "
                 f"(like 'updated_at' or 'pushed_at') that the backup tool tries to compare with strings.\n"
                 f"This can happen with certain repository types or when GitHub API has incomplete data.\n"
-                f"Please check the logs above for more specific information about which repository or item caused this issue."
+                f"Please check the logs above for more specific information about which repository or item caused this issue.",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
             )
         else:
-            logger.error(f"TypeError: {str(e)}")
+            logger.error(
+                f"TypeError: {str(e)}",
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+        _write_failure_status(output_directory, started_at, e)
         sys.exit(1)
     except Exception as e:
-        logger.error(str(e))
+        logger.error(format_exception(e), exc_info=logger.isEnabledFor(logging.DEBUG))
+        _write_failure_status(output_directory, started_at, e)
         sys.exit(1)
+    finally:
+        close_github_http_session()
+
+
+def _write_failure_status(output_directory, started_at, exc, status="failed"):
+    """Record a failed/interrupted run in the status file (best effort).
+
+    Only possible once the output directory exists; failures before that point
+    (e.g. invalid arguments) cannot produce a status file.
+    """
+    if not output_directory or not os.path.isdir(output_directory):
+        return
+    write_status_file(
+        output_directory,
+        status,
+        started_at,
+        error={"type": type(exc).__name__, "message": format_exception(exc)},
+    )
 
 
 if __name__ == "__main__":

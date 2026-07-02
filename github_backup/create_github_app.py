@@ -746,9 +746,7 @@ Examples:
 
 Note: The app name will be prefilled as "{default_app_name}" guessing your username
 from your OS username. You can change this in the web interface if desired.
-        """.format(
-            default_app_name=default_app_name
-        ),
+        """.format(default_app_name=default_app_name),
     )
 
     parser.add_argument(

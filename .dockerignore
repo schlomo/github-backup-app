@@ -1,6 +1,5 @@
 *
 !github_backup/
-!bin/
 !pyproject.toml
 !uv.lock
 !README.md
