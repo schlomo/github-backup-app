@@ -245,7 +245,7 @@ always contains at least a `status` and a `finished_at` field:
   "last_success_at": "2026-06-30T08:49:58.755971+00:00",
   "tool": "github-backup-app",
   "url": "https://github.com/schlomo/github-backup-app",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "python_version": "3.14.6",
   "summary": {
     "installations": 5,
