@@ -67,6 +67,24 @@ to be its own PR that is tested and can be undone on its own.
 
 ## Known limitations and follow-ups
 
+From the second adversarial review (not fixed in 0.4.0):
+
+- **PR images share the release package.** Anyone who can push a branch to
+  this repository can change the workflow and push any tag, including
+  `:latest`. Move PR images to a separate package or gate them behind an
+  approval; pin actions by commit SHA instead of tag; pin `uv`.
+- **First clones cannot resume.** A failed first clone is discarded
+  (`repository.new-mirror/`) and starts over on the next run; a very large
+  repository on a flaky connection may never finish.
+- **Refs outside heads/tags/notes/pull** are not backed up (documented).
+  Fetching `+refs/*:refs/*` needs a way to keep `--prune` away from the
+  archive refs first.
+- **Case-insensitive filesystems** (some NAS/SMB mounts, macOS): refs that
+  differ only in case make the fetch fail on every run (loudly).
+- **A wiki that was never backed up** is skipped when GitHub answers "not
+  found", which GitHub also says for some permission problems.
+- **Ownership tests need root** and are skipped on GitHub-hosted CI.
+
 - **Archive refs are kept forever.** `refs/backup/*` grows with every
   deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
   may be wanted eventually; it must never drop the only copy of a commit

@@ -289,7 +289,7 @@ def test_missing_optional_remote_is_skipped(tmp_path, env):
     target = tmp_path / "wiki"
     assert gb.fetch_repository(
         "w", f"file://{tmp_path}/nope", str(target), env, optional=True
-    ) == (0, True, None)
+    ) == (0, True, None, None)
     assert not target.exists()
 
 
@@ -336,11 +336,18 @@ def test_auth_env_carries_token_as_scoped_header(fake_auth, monkeypatch):
 
     basic = base64.b64encode(f"x-access-token:{FAKE_TOKEN}".encode()).decode()
     key = "http.https://github.com/.extraHeader"
-    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_COUNT"] == "6"
     assert env["GIT_CONFIG_KEY_0"] == "user.name"
-    assert (env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]) == (key, "")
-    assert env["GIT_CONFIG_KEY_2"] == key
-    assert env["GIT_CONFIG_VALUE_2"] == f"Authorization: Basic {basic}"
+    pairs = [
+        (env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(1, 6)
+    ]
+    assert pairs == [
+        (key, ""),
+        (key, f"Authorization: Basic {basic}"),
+        ("http.followRedirects", "false"),
+        ("http.lowSpeedLimit", "1000"),
+        ("http.lowSpeedTime", "600"),
+    ]
     assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
@@ -998,3 +1005,281 @@ def test_loop_reports_recovered_repository_as_success(loop, upstream, tmp_path):
     [recovered] = stats["recovered_repositories"]
     assert recovered["repository"] == "o/r"
     assert os.path.isdir(recovered["moved_to"])
+
+
+# --- Second review round: move aside only on real damage, environment ---------
+
+
+def _chown_tree(path, uid):
+    for root, dirs, files in os.walk(path):
+        for entry in [root, *(os.path.join(root, f) for f in [*dirs, *files])]:
+            os.chown(entry, uid, uid)
+
+
+def test_renamed_default_branch_does_not_move_legacy_clone_aside(
+    upstream, legacy_clone, env
+):
+    """The old --prune left refs/remotes/origin/HEAD dangling, fsck failed."""
+    legacy, reflog_only, dangling = legacy_clone
+    git("branch", "-m", "main", "trunk", cwd=upstream)
+    git("remote", "set-url", "origin", f"file://{upstream}", cwd=legacy)
+    git("fetch", "-q", "--all", "--prune", cwd=legacy)  # as 0.3.0 did
+    git("remote", "set-url", "origin", TOKEN_URL, cwd=legacy)
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+
+    assert result.recovered is None and _quarantined(legacy) == []
+    assert reflog_only in archived(legacy) and dangling in archived(legacy)
+    assert "refs/heads/trunk" in refs(legacy)
+
+
+def test_legacy_clone_of_other_owner_is_refused_not_moved_aside(
+    upstream, legacy_clone, env
+):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to chown")
+    legacy, _, _ = legacy_clone
+    _chown_tree(legacy, 12345)
+    with pytest.raises(gb.GitOwnershipError):
+        gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+    assert _quarantined(legacy) == [] and (legacy / ".git").is_dir()
+
+
+def test_safe_directory_allows_other_owner(upstream, tmp_path, env, monkeypatch):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to chown")
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    _chown_tree(mirror, 12345)
+    config = tmp_path / "gitconfig"
+    config.write_text(f"[safe]\n\tdirectory = {mirror}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    commit(upstream, "new")
+    fetch(upstream, mirror, dict(os.environ))
+    assert refs(mirror)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
+
+
+def test_unreadable_repository_format_fails_without_moving_aside(
+    upstream, tmp_path, env
+):
+    """E.g. a mirror written by a newer git after an image downgrade."""
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    git("config", "core.repositoryformatversion", "1", cwd=mirror)
+    git("config", "extensions.futureFeature", "true", cwd=mirror)
+    commit(upstream, "new")
+    with pytest.raises(gb.GitCommandError):
+        fetch(upstream, mirror, env)
+    assert _quarantined(mirror) == [] and mirror.is_dir()
+
+
+def test_safe_bare_repository_explicit_is_supported(
+    upstream, legacy_clone, tmp_path, env, monkeypatch
+):
+    legacy, _, _ = legacy_clone
+    config = tmp_path / "gitconfig"
+    config.write_text("[safe]\n\tbareRepository = explicit\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    env = dict(os.environ)
+    gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)  # migrate
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)  # fresh clone
+    git("branch", "-D", "hotfix", cwd=upstream)
+    assert fetch(upstream, mirror, env) == 1  # update and archive
+    assert not os.path.exists(str(mirror) + gb.NEW_MIRROR_SUFFIX)
+
+
+def test_journal_with_lost_object_does_not_block_backups(upstream, tmp_path, env):
+    git("checkout", "-q", "hotfix", cwd=upstream)
+    gone = commit(upstream, "only on hotfix")
+    git("checkout", "-q", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    # Killed after a fetch that pruned hotfix, then gc'd outside the tool.
+    gb._write_journal(str(mirror), gb._list_mirrored_refs(str(mirror)))
+    git("update-ref", "-d", "refs/heads/hotfix", cwd=mirror)
+    git("reflog", "expire", "--expire=now", "--all", cwd=mirror)
+    git("gc", "-q", "--prune=now", cwd=mirror)
+    git("branch", "-D", "hotfix", cwd=upstream)
+    commit(upstream, "new")
+
+    assert fetch(upstream, mirror, env) == 0
+    assert refs(mirror)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
+    assert gone not in archived(mirror)
+
+
+def test_mirror_gets_packed_after_fetch_but_not_when_skipped(
+    upstream, tmp_path, env, monkeypatch
+):
+    """git's own gc --auto heuristics decide whether packing is due; this
+    checks that the mirror gives it the chance (gc is off during fetch)."""
+    real_git = gb._git
+    gcs = []
+
+    def spy(args, **kwargs):
+        if "gc" in args:
+            gcs.append(args)
+        return real_git(args, **kwargs)
+
+    monkeypatch.setattr(gb, "_git", spy)
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    commit(upstream, "new")
+    fetch(upstream, mirror, env)
+    assert len(gcs) == 2 and all("--auto" in args for args in gcs)
+    fetch(upstream, mirror, env)  # unchanged: skipped, no gc
+    assert len(gcs) == 2
+
+
+def test_auth_header_never_follows_redirect_to_other_host(fake_auth, tmp_path):
+    seen_by_other = []
+
+    class Other(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_by_other.append(self.headers.get("Authorization"))
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    other = http.server.HTTPServer(("127.0.0.1", 0), Other)
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(301)
+            self.send_header(
+                "Location", f"http://localhost:{other.server_port}{self.path}"
+            )
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    github = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+    for server in (other, github):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    host = f"127.0.0.1:{github.server_port}"
+    try:
+        env = gb.get_git_auth_env(
+            gb.argparse.Namespace(github_host=host), {"_installation_id": 1}
+        )
+        for i in range(int(env["GIT_CONFIG_COUNT"])):
+            if env[f"GIT_CONFIG_KEY_{i}"].endswith(".extraHeader"):
+                env[f"GIT_CONFIG_KEY_{i}"] = f"http.http://{host}/.extraHeader"
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            env.pop(var, None)
+            env.pop(var.lower(), None)
+        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+        with pytest.raises(gb.GitCommandError):
+            gb.fetch_repository("r", f"http://{host}/o/r.git", str(tmp_path / "m"), env)
+    finally:
+        github.shutdown()
+        other.shutdown()
+    assert seen_by_other == []
+
+
+def test_lfs_failure_is_a_warning_and_retried_until_it_succeeds(
+    upstream, tmp_path, env, monkeypatch
+):
+    real_git = gb._git
+    lfs_calls = []
+    lfs_ok = []
+
+    def fake_git(args, **kwargs):
+        if args[:2] == ["lfs", "fetch"]:
+            lfs_calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0 if lfs_ok else 2, "", "" if lfs_ok else "Object does not exist"
+            )
+        return real_git(args, **kwargs)
+
+    monkeypatch.setattr(gb, "_git", fake_git)
+    mirror = tmp_path / "mirror"
+    url = f"file://{upstream}"
+
+    first = gb.fetch_repository("r", url, str(mirror), env, lfs_clone=True)
+    assert "Object does not exist" in first.lfs_error
+    assert (mirror / gb.LFS_INCOMPLETE).exists()
+
+    second = gb.fetch_repository("r", url, str(mirror), env, lfs_clone=True)
+    assert second.skipped and len(lfs_calls) == 2  # retried although skipped
+
+    lfs_ok.append(True)
+    third = gb.fetch_repository("r", url, str(mirror), env, lfs_clone=True)
+    assert third.lfs_error is None and not (mirror / gb.LFS_INCOMPLETE).exists()
+
+    gb.fetch_repository("r", url, str(mirror), env, lfs_clone=True)
+    assert len(lfs_calls) == 3  # unchanged and complete: no LFS walk
+
+
+def test_git_env_factory_is_called_per_step(upstream, tmp_path, env):
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return env
+
+    mirror = tmp_path / "mirror"
+    gb.fetch_repository("r", f"file://{upstream}", str(mirror), factory)
+    assert len(calls) >= 2  # ls-remote and fetch each get a fresh token
+
+
+def test_failed_fresh_clone_after_moving_aside_names_the_old_copy(
+    upstream, legacy_clone, env, monkeypatch
+):
+    legacy, _, _ = legacy_clone
+    _corrupt_packs(legacy / ".git")
+    real = gb._update_mirror
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise gb.GitCommandError("network gone")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(gb, "_update_mirror", flaky)
+    with pytest.raises(gb.GitCommandError) as err:
+        gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+    [moved] = _quarantined(legacy)
+    assert moved in str(err.value) and "network gone" in str(err.value)
+
+
+def test_run_lock_refuses_second_run(tmp_path):
+    first = gb.acquire_run_lock(str(tmp_path))
+    try:
+        with pytest.raises(gb.RunLockedError):
+            gb.acquire_run_lock(str(tmp_path))
+    finally:
+        first.close()
+    gb.acquire_run_lock(str(tmp_path)).close()  # free again
+
+
+@pytest.mark.parametrize(
+    "returncode, stderr, broken",
+    [
+        (2, "error: refs/heads/x: invalid sha1 pointer 1234", True),
+        (2, "missing blob 1234", True),
+        (4, "error: file pack-1.pack is far too short to be a packfile", True),
+        (2, "error: unable to open objects/pack: Permission denied", False),
+        (128, "fatal: unknown repository extension found:", False),
+        (-9, "", False),  # killed, e.g. out of memory
+        (1, "something unexpected", False),
+    ],
+)
+def test_only_evidence_of_damage_counts_as_broken(
+    tmp_path, monkeypatch, returncode, stderr, broken
+):
+    monkeypatch.setattr(
+        gb,
+        "_git",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, returncode, "dangling commit 1234\n", stderr
+        ),
+    )
+    expected = gb.BrokenBackupError if broken else gb.GitCommandError
+    with pytest.raises(expected) as err:
+        gb._fsck(str(tmp_path), "repo")
+    assert type(err.value) is expected
+    assert "dangling" not in str(err.value)

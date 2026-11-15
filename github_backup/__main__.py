@@ -9,6 +9,8 @@ from github_backup.github_backup import (
     backup_repositories,
     check_git_lfs_install,
     check_git_version,
+    acquire_run_lock,
+    RunLockedError,
     close_github_http_session,
     collect_backup_plan,
     filter_repositories,
@@ -64,6 +66,8 @@ def main():
         uses_git = (
             args.include_repository or args.include_wiki or args.include_everything
         )
+        if not args.dry_run:
+            run_lock = acquire_run_lock(output_directory)  # noqa: F841
         if uses_git and not args.dry_run:
             logger.info(f"Using {check_git_version()}")
         if args.lfs_clone:
@@ -140,6 +144,10 @@ def main():
                 "See the status file and logs above for details."
             )
             sys.exit(2)
+    except RunLockedError as e:
+        # The other run owns status.json; do not touch it.
+        logger.error(str(e))
+        sys.exit(3)
     except KeyboardInterrupt:
         logger.warning("Interrupted by user (Ctrl-C). Aborting.")
         _write_failure_status(

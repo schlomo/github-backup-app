@@ -263,6 +263,7 @@ always contains at least a `status` and a `finished_at` field:
     "milestones_skipped_unchanged": 24,
     "git_refs_archived": 3,
     "recovered_repositories": [],
+    "lfs_warnings": [],
     "failed_repositories": []
   }
 }
@@ -316,16 +317,31 @@ the start of the next run. A first clone is built in `repository.new-mirror/`
 and only moved into place once it succeeded.
 
 **A fresh copy is the fallback for any broken backup.** If the local backup
-of a repository is unusable - it fails `git fsck`, a migration cannot be
-finished, the directory is not a git repository, or a git operation fails and
-the mirror is damaged - it is moved aside as `repository.broken-<timestamp>/`
+of a repository is unusable - `git fsck` finds missing or corrupt objects, a
+migration cannot be finished, or the directory exists but is not a git
+repository - it is moved aside as `repository.broken-<timestamp>/`
 (never deleted) and a fresh copy is cloned from GitHub in the same run. The
 repository counts as backed up; `status.json` lists it under
 `recovered_repositories` with the reason and where the old copy went, and the
 log shows a warning. Inspect the old copy (its `refs/backup/*` archive is not
-carried over) and delete it when no longer needed. Problems on the GitHub side
-(network, authentication, outages) and ownership problems never trigger this:
-they fail the repository and leave the backup alone.
+carried over) and delete it when no longer needed. Only positive evidence of
+damage triggers this. Problems on the GitHub side (network, authentication,
+outages), ownership and permission problems, a repository format written by a
+newer git, or a killed process never do: they fail the repository and leave
+the backup alone. If the fresh clone fails too, the error names where the old
+copy went.
+
+**Housekeeping.** Mirrors are packed with `git gc --auto` after each fetch
+(everything worth keeping is reachable from a ref, including the archive).
+Only one run at a time can use a backup directory (`.github-backup.lock`); a
+second run exits with code 3 and leaves `status.json` alone. Stalled transfers
+(below 1 KB/s for 10 minutes) are aborted, and git never follows HTTP
+redirects, so the token cannot be sent to another host.
+
+**Not backed up:** refs outside `refs/heads`, `refs/tags`, `refs/notes` and
+`refs/pull/*/head` (e.g. custom namespaces some tools push). Old `--bare`
+mirrors keep such refs from before the upgrade, but they are no longer
+updated.
 
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
@@ -334,9 +350,11 @@ process (requires git >= 2.31, checked at startup). It never appears in
 a plain `https://github.com/<owner>/<repo>.git`. Git LFS uses the same header
 for its API; LFS storage on other hosts does not receive it.
 
-**Ownership.** git refuses repositories owned by another user ("dubious
-ownership"). Run the backup as the user that owns the backup directory (for
-Docker: `--user <uid>` matching the volume).
+**Ownership.** Like git's "dubious ownership" check, the backup refuses
+repositories owned by another user. Run the backup as the user that owns the
+backup directory (for Docker: `--user <uid>` matching the volume). For shares
+that report a fixed owner (some NAS/SMB mounts), allow the directory with
+git's `safe.directory` setting. `safe.bareRepository=explicit` is supported.
 
 **Restore** a repository into a new, empty GitHub repository:
 
@@ -383,8 +401,13 @@ Recommended procedure: take a filesystem snapshot of the backup directory
 back to 0.3.0 afterwards without its `--bare` flag: without it, 0.3.0 does not
 recognise the mirrors and silently stops backing up git content.
 
-**LFS** (`--lfs`): `git lfs fetch --all` runs after every fetch and covers all
-refs including the archive; LFS objects are never pruned.
+**LFS** (`--lfs`): `git lfs fetch --all` runs after every fetch that changed
+something, and on later runs until it has succeeded once; it covers all refs
+including the archive, and LFS objects are never pruned. Wikis are fetched
+without LFS. An LFS download that fails (e.g. objects GitHub no longer has)
+does not fail the repository: it is listed under `lfs_warnings` in
+`status.json`. git-lfs does not honour the reset of an `extraHeader` inherited
+from your global git config; do not configure one for the GitHub host.
 
 ### Incremental backups
 

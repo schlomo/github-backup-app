@@ -2052,6 +2052,7 @@ def backup_repositories(args, output_directory, repositories):
     milestones_skipped = 0
     git_refs_archived = 0
     recovered_repositories = []
+    lfs_warnings = []
     failed_repositories = []
     accounts = set()
     interrupted = False
@@ -2086,11 +2087,15 @@ def backup_repositories(args, output_directory, repositories):
                         repo_name,
                         repo_url,
                         repo_dir,
-                        get_git_auth_env(args, repository),
+                        lambda: get_git_auth_env(args, repository),
                         skip_existing=args.skip_existing,
                         lfs_clone=args.lfs_clone,
                         force=args.force_full,
                     )
+                    if result.lfs_error:
+                        lfs_warnings.append(
+                            {"repository": repo_full_name, "error": result.lfs_error}
+                        )
                     git_refs_archived += result.archived
                     git_skipped += result.skipped
                     if result.recovered:
@@ -2108,9 +2113,8 @@ def backup_repositories(args, output_directory, repositories):
                         f"{repository['name']} wiki",
                         get_github_wiki_url(args, repository),
                         os.path.join(repo_cwd, "wiki"),
-                        get_git_auth_env(args, repository),
+                        lambda: get_git_auth_env(args, repository),
                         skip_existing=args.skip_existing,
-                        lfs_clone=args.lfs_clone,
                         optional=True,
                         force=args.force_full,
                     )
@@ -2236,6 +2240,7 @@ def backup_repositories(args, output_directory, repositories):
         "milestones_skipped_unchanged": milestones_skipped,
         "git_refs_archived": git_refs_archived,
         "recovered_repositories": recovered_repositories,
+        "lfs_warnings": lfs_warnings,
         "failed_repositories": failed_repositories,
         "interrupted": interrupted,
     }
@@ -2667,16 +2672,25 @@ def check_git_version():
     return output.strip()
 
 
-def _git(git_args, cwd=None, env=None, check=True):
+def _git(git_args, cwd=None, env=None, check=True, git_dir=None):
     """Run git, log its stderr at debug level and raise on failure.
 
     The command line never contains credentials (see get_git_auth_env), so the
     command and its output are safe to log and to put into status.json.
     surrogateescape keeps non-UTF-8 ref names byte-exact when they are passed
     back to git.
+
+    git_dir is passed explicitly instead of being discovered from the working
+    directory: that works with `safe.bareRepository=explicit` and never picks
+    up a repository in a parent directory. It also bypasses git's own
+    ownership check, which _check_ownership therefore does instead.
     """
+    command = ["git"]
+    if git_dir is not None:
+        command.append(f"--git-dir={git_dir}")
+        cwd = cwd or git_dir
     result = subprocess.run(
-        ["git", *git_args],
+        [*command, *git_args],
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -2714,10 +2728,19 @@ def get_git_auth_env(args, repository):
 
     env = os.environ.copy()
     count = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
-    # The empty value first resets any extraHeader inherited from system or
-    # global config, so GitHub never receives two Authorization headers.
-    for value in ("", f"Authorization: Basic {basic}"):
-        env[f"GIT_CONFIG_KEY_{count}"] = key
+    for config_key, value in (
+        # The empty value first resets any extraHeader inherited from system
+        # or global config (git only; git-lfs ignores the reset).
+        (key, ""),
+        (key, f"Authorization: Basic {basic}"),
+        # The header must never follow a redirect to another host; GitHub
+        # needs none, the API gives current repository names.
+        ("http.followRedirects", "false"),
+        # Abort transfers stalled below 1 KB/s for 10 minutes.
+        ("http.lowSpeedLimit", "1000"),
+        ("http.lowSpeedTime", "600"),
+    ):
+        env[f"GIT_CONFIG_KEY_{count}"] = config_key
         env[f"GIT_CONFIG_VALUE_{count}"] = value
         count += 1
     env["GIT_CONFIG_COUNT"] = str(count)
@@ -2729,16 +2752,42 @@ def get_git_auth_env(args, repository):
 def _is_git_dir(path):
     if not os.path.isdir(path):
         return False
-    result = _git(["rev-parse", "--absolute-git-dir"], cwd=path, check=False)
+    result = _git(["rev-parse", "--absolute-git-dir"], git_dir=path, check=False)
     if result.returncode != 0:
-        if "dubious ownership" in result.stderr:
-            raise GitOwnershipError(
-                f"{path} is owned by a different user than the one running the "
-                "backup; run the backup as the owner of the backup directory "
-                f"(e.g. docker run --user). git: {result.stderr.strip()}"
-            )
-        return False
+        if "not a git repository" in result.stderr:
+            return False
+        # E.g. a repository format written by a newer git: not ours to judge
+        # as broken, so fail loudly instead.
+        raise GitCommandError(
+            f"Cannot use {path}: git rev-parse failed with exit code "
+            f"{result.returncode}: {result.stderr.strip()}"
+        )
     return os.path.realpath(result.stdout.strip()) == os.path.realpath(path)
+
+
+def _check_ownership(path):
+    """Refuse a backup owned by another user, as git's "dubious ownership"
+    check would (it does not apply with an explicit --git-dir). Directories
+    allowed by git's safe.directory setting are accepted, e.g. NAS shares
+    that report a fixed owner."""
+    if not hasattr(os, "geteuid") or os.stat(path).st_uid == os.geteuid():
+        return
+    allowed = _git(
+        ["config", "--get-all", "safe.directory"], cwd=os.sep, check=False
+    ).stdout.splitlines()
+    real = os.path.realpath(path)
+    for entry in (e.strip() for e in allowed):
+        if entry == "*" or (entry and os.path.realpath(entry) == real):
+            return
+        if entry.endswith("/*") and real.startswith(
+            os.path.realpath(entry[:-2]) + os.sep
+        ):
+            return
+    raise GitOwnershipError(
+        f"{path} is owned by a different user than the one running the backup; "
+        "run the backup as the owner of the backup directory (e.g. docker run "
+        "--user), or allow it with git's safe.directory setting"
+    )
 
 
 def _list_refs(git_dir, *patterns):
@@ -2749,7 +2798,7 @@ def _list_refs(git_dir, *patterns):
             "--format=%(objectname) %(objecttype) %(refname)",
             *patterns,
         ],
-        cwd=git_dir,
+        git_dir=git_dir,
     ).stdout
     refs = {}
     for line in output.splitlines():
@@ -2767,7 +2816,9 @@ def _list_mirrored_refs(git_dir):
 
 
 def _is_ancestor(git_dir, old, new):
-    result = _git(["merge-base", "--is-ancestor", old, new], cwd=git_dir, check=False)
+    result = _git(
+        ["merge-base", "--is-ancestor", old, new], git_dir=git_dir, check=False
+    )
     return result.returncode == 0
 
 
@@ -2785,9 +2836,9 @@ def _archive_ref(git_dir, label, ref, sha, reason):
         suffix = f"-{attempt}" if attempt else ""
         name = f"{ARCHIVE_REF_PREFIX}/{label}{suffix}/{ref}"
         # An empty old value makes update-ref fail if the ref already exists.
-        if _git(["update-ref", name, sha, ""], cwd=git_dir, check=False).returncode:
+        if _git(["update-ref", name, sha, ""], git_dir=git_dir, check=False).returncode:
             existing = _git(
-                ["rev-parse", "--verify", "--quiet", name], cwd=git_dir, check=False
+                ["rev-parse", "--verify", "--quiet", name], git_dir=git_dir, check=False
             ).stdout.strip()
             if existing == sha:
                 return name
@@ -2839,8 +2890,17 @@ def _settle_journal(git_dir, name):
     archived = 0
     for ref, old in before.items():
         new = after.get(ref)
+        if new == old:
+            continue
+        change = "deleted" if new is None else "rewritten"
+        if _git(["cat-file", "-e", old[0]], git_dir=git_dir, check=False).returncode:
+            # Never let an unrecoverable entry block all future backups.
+            logger.error(
+                f"Cannot archive {change} {ref} of {name}: object {old[0]} is no "
+                "longer in the mirror (garbage collected outside this tool?)"
+            )
+            continue
         if _must_archive(git_dir, ref, old, new):
-            change = "deleted" if new is None else "rewritten"
             _archive_ref(git_dir, label, ref, old[0], f"{change} {ref} of {name}")
             archived += 1
     os.remove(path)
@@ -2863,21 +2923,34 @@ def _drop_commit_graph(git_dir):
         shutil.rmtree(os.path.join(info, "commit-graphs"))
 
 
-def _is_healthy(git_dir):
-    fsck = _git(
-        [*GIT_FSCK_OPTIONS, "fsck", "--connectivity-only", "--no-dangling"],
-        cwd=git_dir,
-        check=False,
-    )
-    return fsck.returncode == 0
+# A backup is only moved aside on positive evidence of missing or corrupt
+# data. Anything else (permissions, an unknown repository format from a newer
+# git, a killed process) fails the repository and leaves the backup alone.
+FSCK_CORRUPTION_MARKERS = (
+    "missing ",
+    "broken link",
+    "corrupt",
+    "bad object",
+    "too short",
+    "unable to read",
+    "invalid sha1 pointer",
+    "hash mismatch",
+    "error in packfile",
+)
+FSCK_ENVIRONMENT_MARKERS = (
+    "permission denied",
+    "repository extension",
+    "repository format",
+    "not a git repository",
+    "out of memory",
+    "cannot allocate",
+)
 
 
-def _rescue_unreferenced(git_dir, label, what):
-    """Archive commits and tags no ref points to any more (only reflogs or
-    nothing), after checking repository integrity.
-
-    Raises, without changing anything, if git fsck reports problems.
-    """
+def _fsck(git_dir, what):
+    """Check repository integrity; return fsck's stdout (incl. "dangling ..."
+    lines, judged without reflogs). Raises BrokenBackupError only on positive
+    evidence of missing or corrupt data, GitCommandError on other failures."""
     _drop_commit_graph(git_dir)
     fsck = _git(
         [
@@ -2888,23 +2961,40 @@ def _rescue_unreferenced(git_dir, label, what):
             "--dangling",
             "--no-progress",
         ],
-        cwd=git_dir,
+        git_dir=git_dir,
         check=False,
     )
-    if fsck.returncode != 0:
-        # Dangling objects are expected here; report only the real problems.
-        problems = fsck.stderr.splitlines() + [
-            line
-            for line in fsck.stdout.splitlines()
-            if not line.startswith("dangling ")
-        ]
+    if fsck.returncode == 0:
+        return fsck.stdout
+    # Dangling objects are expected; report only the real problems.
+    problems = [
+        line.strip()
+        for line in fsck.stderr.splitlines()
+        + [x for x in fsck.stdout.splitlines() if not x.startswith("dangling ")]
+        if line.strip()
+    ]
+    detail = "; ".join(problems)[:1000]
+    text = detail.lower()
+    if (
+        fsck.returncode > 0
+        and not any(marker in text for marker in FSCK_ENVIRONMENT_MARKERS)
+        and any(marker in text for marker in FSCK_CORRUPTION_MARKERS)
+    ):
         raise BrokenBackupError(
-            f"Not migrating {what}: git fsck reports problems (exit code "
-            f"{fsck.returncode}), it was left untouched: "
-            + "; ".join(line.strip() for line in problems if line.strip())[:1000]
+            f"git fsck of {what} found missing or corrupt data, it was left "
+            f"untouched: {detail}"
         )
+    raise GitCommandError(
+        f"git fsck of {what} failed (exit code {fsck.returncode}), it was left "
+        f"untouched: {detail}"
+    )
+
+
+def _rescue_unreferenced(git_dir, label, what):
+    """Archive commits and tags no ref points to any more (only reflogs or
+    nothing), after checking repository integrity (see _fsck)."""
     unreferenced = []
-    for line in fsck.stdout.splitlines():
+    for line in _fsck(git_dir, what).splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[0] == "dangling" and parts[1] in ("commit", "tag"):
             unreferenced.append((parts[1], parts[2]))
@@ -2933,7 +3023,14 @@ def _migrate_working_clone_to_mirror(local_dir):
     old_git_dir = dot_git if os.path.isdir(dot_git) else tmp_dir
     stamp = _archive_timestamp()
 
-    # Checks integrity before anything is modified.
+    # A pointer, not data, and removed with the remote below anyway. After a
+    # default-branch rename upstream it dangles, which fsck reports.
+    _git(
+        ["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        git_dir=old_git_dir,
+        check=False,
+    )
+    # Checks integrity before anything else is modified.
     archive_unreferenced = _rescue_unreferenced(
         old_git_dir, f"{stamp}-migration-unreferenced", local_dir
     )
@@ -2942,8 +3039,8 @@ def _migrate_working_clone_to_mirror(local_dir):
         logger.info(f"Migrating {local_dir} to a bare mirror")
         os.rename(dot_git, tmp_dir)
 
-    _git(["config", "core.bare", "true"], cwd=tmp_dir)
-    _git(["config", "--unset", "core.worktree"], cwd=tmp_dir, check=False)
+    _git(["config", "core.bare", "true"], git_dir=tmp_dir)
+    _git(["config", "--unset", "core.worktree"], git_dir=tmp_dir, check=False)
     index = os.path.join(tmp_dir, "index")
     if os.path.exists(index):
         os.remove(index)
@@ -2974,10 +3071,10 @@ def _migrate_working_clone_to_mirror(local_dir):
                     f"stale local branch {branch}",
                 )
                 if upstream is None:
-                    _git(["update-ref", "-d", name], cwd=tmp_dir)
+                    _git(["update-ref", "-d", name], git_dir=tmp_dir)
 
         for branch, sha in remote_refs.items():
-            _git(["update-ref", f"refs/heads/{branch}", sha], cwd=tmp_dir)
+            _git(["update-ref", f"refs/heads/{branch}", sha], git_dir=tmp_dir)
 
     # Verify before anything is removed: every upstream branch must now be a
     # real branch at the same commit.
@@ -2995,7 +3092,7 @@ def _migrate_working_clone_to_mirror(local_dir):
 
     # Drops refs/remotes/origin/* and the old remote config (incl. any
     # token-bearing URL); _configure_mirror re-adds a clean one.
-    _git(["remote", "remove", "origin"], cwd=tmp_dir, check=False)
+    _git(["remote", "remove", "origin"], git_dir=tmp_dir, check=False)
 
     if os.path.exists(local_dir):
         if os.path.exists(os.path.join(local_dir, ".git")):
@@ -3008,7 +3105,7 @@ def _migrate_working_clone_to_mirror(local_dir):
 
 def _configure_mirror(git_dir, remote_url):
     config = _git(
-        ["config", "--get-regexp", r"^remote\.origin\."], cwd=git_dir, check=False
+        ["config", "--get-regexp", r"^remote\.origin\."], git_dir=git_dir, check=False
     )
     current = {}
     for line in config.stdout.splitlines():
@@ -3016,22 +3113,50 @@ def _configure_mirror(git_dir, remote_url):
         current.setdefault(key, []).append(value)
     if current.get("remote.origin.url") != [remote_url]:
         # Also replaces legacy URLs that embedded an access token.
-        _git(["config", "--replace-all", "remote.origin.url", remote_url], cwd=git_dir)
+        _git(
+            ["config", "--replace-all", "remote.origin.url", remote_url],
+            git_dir=git_dir,
+        )
     if "remote.origin.mirror" in current:
         # A `git clone --mirror` from the old --bare mode: rescue commits an
         # earlier --prune left unreferenced, then drop the mirror settings.
         _rescue_unreferenced(
             git_dir, f"{_archive_timestamp()}-migration-unreferenced", git_dir
         )(git_dir)
-        _git(["config", "--unset-all", "remote.origin.mirror"], cwd=git_dir)
+        _git(["config", "--unset-all", "remote.origin.mirror"], git_dir=git_dir)
         # Its refspec also fetched GitHub's synthetic merge refs.
         for name in _list_refs(git_dir, "refs/pull"):
             if name.endswith("/merge"):
-                _git(["update-ref", "-d", name], cwd=git_dir)
+                _git(["update-ref", "-d", name], git_dir=git_dir)
     if current.get("remote.origin.fetch") != list(GIT_FETCH_REFSPECS):
-        _git(["config", "--unset-all", "remote.origin.fetch"], cwd=git_dir, check=False)
+        _git(
+            ["config", "--unset-all", "remote.origin.fetch"],
+            git_dir=git_dir,
+            check=False,
+        )
         for refspec in GIT_FETCH_REFSPECS:
-            _git(["config", "--add", "remote.origin.fetch", refspec], cwd=git_dir)
+            _git(["config", "--add", "remote.origin.fetch", refspec], git_dir=git_dir)
+
+
+class RunLockedError(Exception):
+    pass
+
+
+def acquire_run_lock(output_directory):
+    """Hold an exclusive lock on the backup directory for this process'
+    lifetime, so overlapping runs (e.g. cron) never work on the same mirrors
+    or journals. Returns the open lock file; keep a reference to it."""
+    import fcntl
+
+    handle = open(os.path.join(output_directory, ".github-backup.lock"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RunLockedError(
+            f"Another github-backup run is using {output_directory}; not starting"
+        )
+    return handle
 
 
 def _has_backup(local_dir):
@@ -3045,6 +3170,13 @@ def ensure_mirror_repository(local_dir, remote_url):
 
     Returns True if local_dir is a mirror afterwards.
     """
+    for path in (
+        local_dir,
+        os.path.join(local_dir, ".git"),
+        local_dir + MIGRATION_SUFFIX,
+    ):
+        if os.path.exists(path):
+            _check_ownership(path)
     if os.path.isdir(os.path.join(local_dir, ".git")) or os.path.isdir(
         local_dir + MIGRATION_SUFFIX
     ):
@@ -3079,7 +3211,17 @@ def _parse_ls_remote(output):
     return default_ref, remote
 
 
-FetchResult = namedtuple("FetchResult", "archived skipped recovered", defaults=(None,))
+FetchResult = namedtuple(
+    "FetchResult", "archived skipped recovered lfs_error", defaults=(None, None)
+)
+LFS_INCOMPLETE = "backup-lfs-incomplete"
+
+
+def _env(git_env):
+    """git_env may be a callable, so long runs get a fresh token per step."""
+    return git_env() if callable(git_env) else git_env
+
+
 BROKEN_SUFFIX = ".broken-"
 
 
@@ -3116,7 +3258,13 @@ def fetch_repository(name, remote_url, local_dir, git_env, **kwargs):
             f"{moved_to} (kept for inspection, delete when no longer needed) "
             "and cloning a fresh copy."
         )
-        result = _fetch_repository(name, remote_url, local_dir, git_env, **kwargs)
+        try:
+            result = _fetch_repository(name, remote_url, local_dir, git_env, **kwargs)
+        except Exception as clone_error:
+            raise GitCommandError(
+                f"Backup of {name} was unusable ({e}) and was moved to {moved_to}; "
+                f"cloning a fresh copy failed: {clone_error}"
+            ) from clone_error
         return result._replace(recovered={"moved_to": moved_to, "reason": str(e)})
 
 
@@ -3147,7 +3295,9 @@ def _fetch_repository(
         ensure_mirror_repository(local_dir, remote_url)
         return FetchResult(0, True)
 
-    listing = _git(["ls-remote", "--symref", remote_url], env=git_env, check=False)
+    listing = _git(
+        ["ls-remote", "--symref", remote_url], env=_env(git_env), check=False
+    )
     if listing.returncode != 0:
         if optional and not _has_backup(local_dir) and _remote_missing(listing.stderr):
             logger.debug(f"Skipping {name} (remote does not exist)")
@@ -3174,11 +3324,16 @@ def _fetch_repository(
     except GitCommandError as e:
         # GitHub answered ls-remote moments ago, so a git failure on an
         # existing backup that also fails its integrity check is local.
-        has_git_backup = _is_git_dir(local_dir) or os.path.isdir(
-            os.path.join(local_dir, ".git")
+        git_dir = (
+            local_dir if _is_git_dir(local_dir) else os.path.join(local_dir, ".git")
         )
-        if has_git_backup and not _is_healthy(local_dir):
-            raise BrokenBackupError(f"local backup is damaged: {e}") from e
+        if os.path.isdir(git_dir):
+            try:
+                _fsck(git_dir, local_dir)
+            except BrokenBackupError as broken:
+                raise BrokenBackupError(f"{broken} (after: {e})") from e
+            except GitCommandError:
+                pass  # no evidence of damage: report the original failure
         raise
 
 
@@ -3217,8 +3372,8 @@ def _update_mirror(
         try:
             _git(
                 [*GIT_NO_AUTO_GC, "fetch", "--quiet", "--force", "--prune", "origin"],
-                cwd=target,
-                env=git_env,
+                git_dir=target,
+                env=_env(git_env),
             )
         except GitCommandError as e:
             fetch_error = e
@@ -3232,27 +3387,46 @@ def _update_mirror(
             logger.error(f"Archiving refs of {name} failed: {settle_error}")
         if fetch_error is not None:
             raise fetch_error
+        # Pack loose objects now and then. Safe: everything worth keeping is
+        # reachable from a ref, including the archive.
+        _git(["-c", "gc.autoDetach=false", "gc", "--auto", "--quiet"], git_dir=target)
 
     # Point HEAD at the remote default branch so a clone of the mirror checks
     # out the right branch (the default branch can change without a push).
     if default_ref and default_ref in remote_refs:
-        current = _git(["symbolic-ref", "-q", "HEAD"], cwd=target, check=False)
+        current = _git(["symbolic-ref", "-q", "HEAD"], git_dir=target, check=False)
         if current.stdout.strip() != default_ref:
-            _git(["symbolic-ref", "HEAD", default_ref], cwd=target)
+            _git(["symbolic-ref", "HEAD", default_ref], git_dir=target)
 
     if not existed:
         if os.path.exists(local_dir):
             os.rmdir(local_dir)  # checked to be empty above
         os.rename(target, local_dir)
 
-    if lfs_clone:
-        # Runs even when the git fetch was skipped, so an LFS download that
-        # failed in an earlier run is retried (it only fetches what is
-        # missing). No --prune: pruning LFS objects of old commits defeats a
-        # backup. --all covers every ref, including the archive refs.
-        _git(["lfs", "fetch", "--all", "origin"], cwd=local_dir, env=git_env)
+    lfs_error = None
+    marker = os.path.join(local_dir, LFS_INCOMPLETE)
+    if lfs_clone and (not skipped or os.path.exists(marker)):
+        # Also when the git fetch was skipped but an earlier LFS download
+        # failed (it only fetches what is missing). No --prune: pruning LFS
+        # objects of old commits defeats a backup. --all covers every ref,
+        # including the archive refs. LFS objects GitHub no longer has would
+        # fail the repository on every run, so failures are reported as a
+        # warning; the git backup itself is complete.
+        lfs = _git(
+            ["lfs", "fetch", "--all", "origin"],
+            git_dir=local_dir,
+            env=_env(git_env),
+            check=False,
+        )
+        if lfs.returncode:
+            lfs_error = lfs.stderr.strip()[-1000:] or f"exit code {lfs.returncode}"
+            with open(marker, "w") as f:
+                f.write(lfs_error + "\n")
+            logger.warning(f"LFS download of {name} incomplete: {lfs_error}")
+        elif os.path.exists(marker):
+            os.remove(marker)
 
-    return FetchResult(archived, skipped)
+    return FetchResult(archived, skipped, lfs_error=lfs_error)
 
 
 def backup_account(args, output_directory):
