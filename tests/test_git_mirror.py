@@ -519,3 +519,43 @@ def test_loop_migrates_and_scrubs_token_even_when_git_is_skipped(
     mirror = repo_cwd / "repository"
     assert git("rev-parse", "--is-bare-repository", cwd=mirror) == "true"
     assert files_containing(mirror, FAKE_TOKEN) == []
+
+
+# --- Environment --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "output, ok",
+    [
+        ("git version 2.31.0\n", True),
+        ("git version 2.52.0.windows.1\n", True),
+        ("git version 3.0.0\n", True),
+        ("git version 2.30.9\n", False),
+        ("git version 1.99.0\n", False),
+        ("garbage\n", False),
+    ],
+)
+def test_check_git_version(monkeypatch, output, ok):
+    monkeypatch.setattr(
+        gb.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=output),
+    )
+    if ok:
+        assert gb.check_git_version() == output.strip()
+    else:
+        with pytest.raises(Exception, match="git >= 2.31 is required"):
+            gb.check_git_version()
+
+
+def test_check_git_version_reports_missing_git(monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(gb.subprocess, "run", missing)
+    with pytest.raises(Exception, match="git is required"):
+        gb.check_git_version()
+
+
+def test_installed_git_is_supported():
+    gb.check_git_version()

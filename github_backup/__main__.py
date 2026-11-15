@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from github_backup.github_backup import (
     backup_repositories,
     check_git_lfs_install,
+    check_git_version,
     close_github_http_session,
     collect_backup_plan,
     filter_repositories,
@@ -60,6 +61,8 @@ def main():
             logger.info("Creating output directory {0}".format(output_directory))
             mkdir_p(output_directory)
 
+        if not args.dry_run:
+            logger.info(f"Using {check_git_version()}")
         if args.lfs_clone:
             check_git_lfs_install()
 

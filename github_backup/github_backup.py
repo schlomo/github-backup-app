@@ -2627,8 +2627,30 @@ MIGRATION_SUFFIX = ".mirror-migration"
 GIT_NO_AUTO_GC = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
 
 
+# GIT_CONFIG_COUNT (how credentials reach git, see get_git_auth_env) needs git
+# 2.31. Older git silently ignores it, so git would run unauthenticated.
+MIN_GIT_VERSION = (2, 31)
+
+
 class GitCommandError(Exception):
     pass
+
+
+def check_git_version():
+    """Fail fast unless a git that supports everything we rely on is present."""
+    try:
+        output = subprocess.run(
+            ["git", "--version"], capture_output=True, text=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise Exception(f"git is required but could not be run: {e}") from e
+    match = re.search(r"(\d+)\.(\d+)", output)
+    if not match or tuple(map(int, match.groups())) < MIN_GIT_VERSION:
+        raise Exception(
+            f"git >= {'.'.join(map(str, MIN_GIT_VERSION))} is required, "
+            f"found: {output.strip() or 'unknown'}"
+        )
+    return output.strip()
 
 
 def _git(git_args, cwd=None, env=None, check=True):
