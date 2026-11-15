@@ -8,7 +8,7 @@ This project is a fork of [python-backup](https://github.com/josegonzalez/python
 
 ## What This Tool Does
 
-- **Git repositories** — bare mirrors of all branches, tags and pull-request heads; deleted or force-pushed refs are archived, never lost; automatic skip when `pushed_at` is unchanged
+- **Git repositories** — bare mirrors of all branches, tags and pull-request heads; deleted or force-pushed refs are archived, never lost; fetch skipped when no ref changed on GitHub
 - **JSON metadata** — issues, pull requests, comments, milestones, labels, hooks, releases
 - **Organized storage** — `{output}/{owner}/repositories/{repo}/…` mirrors GitHub's structure
 - **GitHub App auth** — one app, many installations; no personal access tokens or SSH keys to rotate
@@ -19,7 +19,7 @@ This project is a fork of [python-backup](https://github.com/josegonzalez/python
 |---------|-------------|
 | **Multi-installation discovery** | One run backs up every org/user where the app is installed; filter with positional args (`jschule myorg`) |
 | **Automatic incremental** | No `-i` flag and no separate state files — skip decisions come from the backup data on disk (`repo.json`, per-item JSON) |
-| **Git skip** | Unchanged repos skip `git fetch` when stored `pushed_at` matches the API |
+| **Git skip** | One `git ls-remote` per repository; `git fetch` is skipped when every ref equals the backup |
 | **Per-item metadata skip** | Unchanged issues/PRs/milestones skip comment/event/commit fetches and file rewrites |
 | **GraphQL metadata bundle** | One paginated query per repo fetches issues, PRs, milestones, labels, and releases together |
 | **HTTP keep-alive** | Shared `requests.Session` reuses TLS connections across API calls |
@@ -34,7 +34,7 @@ This project is a fork of [python-backup](https://github.com/josegonzalez/python
 
 | | python-backup | github-backup-app |
 |---|---------------------|-------------------|
-| **Git fetch on repeat runs** | Always runs `git fetch` when a clone exists | Skips fetch when `repo.json` `pushed_at` is unchanged |
+| **Git fetch on repeat runs** | Always runs `git fetch` when a clone exists | Skips fetch when `git ls-remote` shows no changed ref |
 | **Metadata list API calls** | Separate REST list call per resource (issues ×2 states, pulls ×2, milestones, labels, releases, …) | One GraphQL query bundles issues, PRs, milestones, labels, releases |
 | **HTTP connections** | `urllib` — new connection per request | `requests.Session` with keep-alive (~3× lower per-call latency) |
 | **Incremental model** | Opt-in `-i` flag; `last_update` checkpoint files; API `since=` time filter | Always on; compares stored JSON timestamps; no checkpoint files |
@@ -55,7 +55,10 @@ Real runs on the same backup directory (incremental, `--all`):
 | 5 repos — GraphQL + Session | **~18s** | ~3.7× faster |
 | 111 repos (5 installations) — GraphQL + Session | **~381s** | 110 git skips, 2223 issues + 1661 PRs skipped unchanged |
 
-On a quiet estate where most repos haven't changed, the dominant cost shifts from git fetches and metadata listing to wiki probes and hooks (still REST-only).
+On a quiet estate where most repos haven't changed, the dominant cost shifts from git fetches and metadata listing to wiki probes and hooks (still REST-only). These numbers were measured with
+the earlier `pushed_at`-based git skip, which needed no network call for
+unchanged repositories; the current ref comparison adds one `git ls-remote`
+round trip per repository and wiki.
 
 ## Quick Start
 
@@ -302,18 +305,13 @@ every tag that changed at all, is preserved as
 `refs/tags` therefore always equal GitHub's current state, while the rewritten
 history stays reachable (and is never garbage collected). Archive refs are
 never overwritten. `status.json` counts them in `git_refs_archived`.
-`--no-prune` keeps deleted refs in place instead of archiving them.
+`--no-prune` is deprecated and has no effect.
 
 This also holds when a run fails or is killed: before each fetch the current
 refs are written to a journal (`backup-refs-journal` inside the mirror), and
 whatever changed is archived after the fetch - successful or failed - or at
 the start of the next run. A first clone is built in `repository.new-mirror/`
 and only moved into place once it succeeded.
-
-**Known gap:** the git fetch is skipped while the repository's `pushed_at` is
-unchanged (see below). Pushes to a fork that update an open pull request most
-likely do not change the base repository's `pushed_at`, so such PR heads are
-only refreshed with the next push to the repository itself.
 
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
@@ -378,17 +376,13 @@ Incremental backups are automatic; there is no flag to enable them and no
 separate state file. Every skip decision is derived from the backup data already
 on disk, so the backup directory alone explains what was skipped and why.
 
-**Repository git** — each repository's metadata is written to `repo.json` in its
-backup folder. This is useful backup data in its own right (description, topics,
-visibility, default branch, archived state, ...) and its `pushed_at` field
-doubles as the incremental signal. On the next run, if a repository's current
-`pushed_at` (from the GitHub API) matches the value stored in `repo.json` **and**
-a local clone already exists, the (often dominant) `git fetch` is skipped.
-`pushed_at` changes on every push (including tags and force-pushes), so this is
-safe for branches and tags. Pull-request heads of PRs from forks change
-without a push to the repository itself; they are picked up the next time the
-repository is fetched. `repo.json` is refreshed on every successful run, so metadata stays
-current even when the git fetch is skipped.
+**Repository git and wiki** — one `git ls-remote` lists every ref on GitHub
+(branches, tags, notes, pull request heads). If all of them equal the refs in
+the mirror, the (often dominant) `git fetch` is skipped. Unlike the
+repository's `pushed_at`, this also notices pull request heads updated from a
+fork, wiki edits, and branch deletions. Each repository's metadata is written
+to `repo.json` after a fully successful pass, so metadata stays current even
+when the git fetch is skipped.
 
 **Issues, pull requests and milestones** — for each item, its stored
 `<number>.json` already records `updated_at`. If that is at least as new as the
@@ -404,9 +398,6 @@ list calls. Hooks still use REST (not available via GraphQL).
 keep-alive, so repeated calls to the same host reuse the TLS connection instead
 of paying a full handshake on every request.
 
-**Wiki** — always fetched (a no-op when unchanged), because wiki edits are not
-reflected in the repository's `pushed_at`.
-
 **Releases** — release asset binaries are not re-downloaded when a file of the
 same name already exists on disk. Release metadata and asset listings come from
 the same GraphQL query as other repository metadata (no separate per-release
@@ -418,10 +409,10 @@ Notes:
   issues/PRs, because it only reflects repository *metadata* changes, not
   issue/PR/comment activity — relying on it would risk silently missing data.
 - Use `--force-full` to ignore all stored timestamps and re-fetch everything
-  (git content and every issue/pull/milestone). Deleting a repo's `repo.json`
-  (or an item's JSON) has the same effect for that item.
-- Interrupting a run with Ctrl-C stops cleanly; each repository finished so far
-  has its `repo.json` saved, so the next run skips them and resumes quickly.
+  (git content and every issue/pull/milestone). Deleting an item's JSON has
+  the same effect for that item.
+- Interrupting a run with Ctrl-C stops cleanly; repositories finished so far
+  are unchanged on the next run and are skipped quickly.
 - `status.json` reports how much was skipped via
   `repositories_git_skipped_unchanged`, `issues_skipped_unchanged`,
   `pulls_skipped_unchanged` and `milestones_skipped_unchanged`.

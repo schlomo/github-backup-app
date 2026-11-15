@@ -19,6 +19,7 @@ import ssl
 import subprocess
 import sys
 import time
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
@@ -658,12 +659,9 @@ def fetch_repository_metadata_graphql(args, repository, fetch):
 def write_repo_metadata(repo_cwd, repository):
     """Persist the repository metadata object as ``repo.json`` (atomic).
 
-    This serves two purposes:
-
-    1. It is useful backup data in its own right (description, topics,
-       visibility, default branch, archived state, ...).
-    2. Its ``pushed_at`` field is the on-disk signal used to decide whether the
-       next run can skip this repository's git fetch.
+    It is useful backup data in its own right (description, topics,
+    visibility, default branch, archived state, ...) and marks the repository
+    as completely backed up by the last run.
 
     Internal bookkeeping keys (prefixed with ``_``, added during discovery) are
     stripped so the file contains only GitHub's own data.
@@ -925,8 +923,8 @@ def parse_args(args=None):
         action="store_true",
         dest="no_prune",
         help=(
-            "keep branches/tags deleted on GitHub in place instead of moving "
-            "them to refs/backup/<timestamp>/"
+            "deprecated, no effect: refs deleted on GitHub are always moved "
+            "to refs/backup/<timestamp>/"
         ),
     )
     parser.add_argument(
@@ -2041,11 +2039,8 @@ def backup_repositories(args, output_directory, repositories):
     logger.info(f"Number of repositories to backup: {len(repositories)}")
     repos_template = "https://{0}/repos".format(get_github_api_host(args))
 
-    # Incremental skip is driven entirely by the backup data on disk: each
-    # repository's previous `pushed_at` is read back from its own `repo.json`.
-    # A repository's git content has not changed iff its current `pushed_at`
-    # (from the API list response) equals the stored one, which lets us skip the
-    # (often dominant) git fetch entirely.
+    # Git: fetch_repository compares GitHub's refs (one ls-remote) with the
+    # mirror and skips the (often dominant) fetch when nothing changed.
     # NOTE: we deliberately do NOT use the repository's `updated_at` to skip
     # issues/PRs/etc. - that field only reflects repository *metadata* changes,
     # not issue/PR/comment activity, so trusting it would silently miss data.
@@ -2082,47 +2077,25 @@ def backup_repositories(args, output_directory, repositories):
             # backing up its issues, PRs and releases in the same run.
             git_errors = []
 
-            pushed_at = repository.get("pushed_at")
-            stored_pushed_at = read_json_field(
-                os.path.join(repo_cwd, REPO_METADATA_FILENAME), "pushed_at"
-            )
-            git_unchanged = (
-                not args.force_full
-                and pushed_at is not None
-                and stored_pushed_at == pushed_at
-                and os.path.exists(repo_dir)
-            )
-
             if args.include_repository or args.include_everything:
                 repo_name = repository.get("name")
                 try:
-                    if git_unchanged:
-                        logger.info(
-                            f"Repository {repo_name} unchanged since last backup "
-                            f"(pushed_at={pushed_at}); skipping git fetch"
-                        )
-                        git_skipped += 1
-                        # Local only: migrates legacy clones to the mirror
-                        # layout and scrubs token-bearing remote URLs.
-                        ensure_mirror_repository(repo_dir, repo_url)
-                    else:
-                        logger.info(f"Backing up repository: {repo_name} to {repo_cwd}")
-                        mkdir_p(repo_cwd)
-                        git_refs_archived += fetch_repository(
-                            repo_name,
-                            repo_url,
-                            repo_dir,
-                            get_git_auth_env(args, repository),
-                            skip_existing=args.skip_existing,
-                            lfs_clone=args.lfs_clone,
-                            no_prune=args.no_prune,
-                        )
+                    mkdir_p(repo_cwd)
+                    result = fetch_repository(
+                        repo_name,
+                        repo_url,
+                        repo_dir,
+                        get_git_auth_env(args, repository),
+                        skip_existing=args.skip_existing,
+                        lfs_clone=args.lfs_clone,
+                        force=args.force_full,
+                    )
+                    git_refs_archived += result.archived
+                    git_skipped += result.skipped
                 except Exception as e:
                     logger.error(f"Git backup of {repo_full_name} failed: {e}")
                     git_errors.append(e)
 
-            # Wiki edits are NOT reflected in the repository's pushed_at, so the
-            # wiki is always fetched (a no-op when unchanged) to never miss one.
             download_wiki = args.include_wiki or args.include_everything
             if repository["has_wiki"] and download_wiki:
                 try:
@@ -2133,9 +2106,9 @@ def backup_repositories(args, output_directory, repositories):
                         get_git_auth_env(args, repository),
                         skip_existing=args.skip_existing,
                         lfs_clone=args.lfs_clone,
-                        no_prune=args.no_prune,
                         optional=True,
-                    )
+                        force=args.force_full,
+                    ).archived
                 except Exception as e:
                     logger.error(f"Wiki backup of {repo_full_name} failed: {e}")
                     git_errors.append(e)
@@ -2216,13 +2189,10 @@ def backup_repositories(args, output_directory, repositories):
                     prefetched_releases=metadata_bundle.get("releases"),
                 )
 
-            # Persist repository metadata as backup data. Its `pushed_at`
-            # becomes the on-disk signal that lets the next run skip this
-            # repo's git fetch while the content stays unchanged. Written
-            # only after a successful pass so a mid-repo failure does not
-            # mark git as up-to-date when it isn't. Because this also runs
-            # when the git fetch was skipped, metadata (description, topics,
-            # ...) stays current every run.
+            # Persist repository metadata as backup data, only after a fully
+            # successful pass, so repo.json marks a complete backup. Because
+            # this also runs when the git fetch was skipped, metadata
+            # (description, topics, ...) stays current every run.
             if git_errors:
                 raise git_errors[0]
             write_repo_metadata(repo_cwd, repository)
@@ -3028,6 +2998,28 @@ def _remote_missing(stderr):
     return "not found" in stderr or "does not appear to be a git repository" in stderr
 
 
+def _parse_ls_remote(output):
+    """Return (default branch ref or None, {mirrored refname: object id})."""
+    default_ref = None
+    remote = {}
+    for line in output.splitlines():
+        if line.startswith("ref: ") and line.endswith("\tHEAD"):
+            default_ref = line[len("ref: ") : -len("\tHEAD")]
+            continue
+        sha, _, ref = line.partition("\t")
+        if ref.endswith("^{}") or not ref.startswith(
+            tuple(f"{ns}/" for ns in MIRRORED_REF_NAMESPACES)
+        ):
+            continue
+        if ref.startswith("refs/pull/") and not ref.endswith("/head"):
+            continue
+        remote[ref] = sha
+    return default_ref, remote
+
+
+FetchResult = namedtuple("FetchResult", "archived skipped")
+
+
 def fetch_repository(
     name,
     remote_url,
@@ -3035,29 +3027,36 @@ def fetch_repository(
     git_env,
     skip_existing=False,
     lfs_clone=False,
-    no_prune=False,
     optional=False,
+    force=False,
 ):
     """Create or update the bare mirror of one repository.
 
-    Returns the number of refs archived because GitHub deleted or rewrote them.
-    With optional=True (wikis), a remote that does not exist is skipped as long
-    as we hold no backup of it; every other git failure raises, so the caller
-    does not record the repository as backed up.
+    Change detection: one `git ls-remote` lists every ref on GitHub; if they
+    all equal the mirror's refs, the (expensive) fetch is skipped. Unlike the
+    repository's `pushed_at`, this also sees pull request heads updated from
+    forks. force=True always fetches.
+
+    Returns FetchResult(archived=<refs archived because GitHub deleted or
+    rewrote them>, skipped=<fetch was not needed>). With optional=True
+    (wikis), a remote that does not exist is skipped as long as we hold no
+    backup of it; every other git failure raises, so the caller does not
+    record the repository as backed up.
     """
     if skip_existing and _has_backup(local_dir):
         ensure_mirror_repository(local_dir, remote_url)
-        return 0
+        return FetchResult(0, True)
 
-    head = _git(["ls-remote", "--symref", remote_url, "HEAD"], env=git_env, check=False)
-    if head.returncode != 0:
-        if optional and not _has_backup(local_dir) and _remote_missing(head.stderr):
+    listing = _git(["ls-remote", "--symref", remote_url], env=git_env, check=False)
+    if listing.returncode != 0:
+        if optional and not _has_backup(local_dir) and _remote_missing(listing.stderr):
             logger.debug(f"Skipping {name} (remote does not exist)")
-            return 0
+            return FetchResult(0, True)
         raise GitCommandError(
             f"git ls-remote {remote_url} failed with exit code "
-            f"{head.returncode}: {head.stderr.strip()}"
+            f"{listing.returncode}: {listing.stderr.strip()}"
         )
+    default_ref, remote_refs = _parse_ls_remote(listing.stdout)
 
     existed = ensure_mirror_repository(local_dir, remote_url)
     if existed:
@@ -3073,32 +3072,37 @@ def fetch_repository(
             shutil.rmtree(target)
         _git(["init", "--quiet", "--bare", target])
         _configure_mirror(target, remote_url)
-    logger.info(
-        f"{'Updating' if existed else 'Cloning'} {name} mirror from {remote_url} "
-        f"in {local_dir}"
-    )
 
     # Finish archiving for a run that was killed during or after its fetch.
     archived = _settle_journal(target, name)
-    _write_journal(target, _list_mirrored_refs(target))
-    fetch = [*GIT_NO_AUTO_GC, "fetch", "--quiet", "--force"]
-    if not no_prune:
-        fetch.append("--prune")
-    fetch.append("origin")
-    try:
-        _git(fetch, cwd=target, env=git_env)
-    finally:
-        # Also after a failed fetch: --prune deletes refs before transferring.
-        archived += _settle_journal(target, name)
+
+    local_refs = {ref: sha for ref, (sha, _) in _list_mirrored_refs(target).items()}
+    skipped = existed and not force and local_refs == remote_refs
+    if skipped:
+        logger.info(f"{name} unchanged on GitHub; skipping git fetch")
+    else:
+        logger.info(
+            f"{'Updating' if existed else 'Cloning'} {name} mirror from "
+            f"{remote_url} in {local_dir}"
+        )
+        _write_journal(target, _list_mirrored_refs(target))
+        try:
+            _git(
+                [*GIT_NO_AUTO_GC, "fetch", "--quiet", "--force", "--prune", "origin"],
+                cwd=target,
+                env=git_env,
+            )
+        finally:
+            # Also after a failed fetch: --prune deletes refs before
+            # transferring objects.
+            archived += _settle_journal(target, name)
 
     # Point HEAD at the remote default branch so a clone of the mirror checks
-    # out the right branch.
-    mirrored = _list_mirrored_refs(target)
-    for line in head.stdout.splitlines():
-        if line.startswith("ref: ") and line.endswith("\tHEAD"):
-            default_ref = line[len("ref: ") : -len("\tHEAD")]
-            if default_ref in mirrored:
-                _git(["symbolic-ref", "HEAD", default_ref], cwd=target)
+    # out the right branch (the default branch can change without a push).
+    if default_ref and default_ref in remote_refs:
+        current = _git(["symbolic-ref", "-q", "HEAD"], cwd=target, check=False)
+        if current.stdout.strip() != default_ref:
+            _git(["symbolic-ref", "HEAD", default_ref], cwd=target)
 
     if not existed:
         if os.path.exists(local_dir):
@@ -3106,11 +3110,13 @@ def fetch_repository(
         os.rename(target, local_dir)
 
     if lfs_clone:
-        # No --prune: pruning LFS objects of old commits defeats a backup.
-        # --all covers every ref, including the archive refs.
+        # Runs even when the git fetch was skipped, so an LFS download that
+        # failed in an earlier run is retried (it only fetches what is
+        # missing). No --prune: pruning LFS objects of old commits defeats a
+        # backup. --all covers every ref, including the archive refs.
         _git(["lfs", "fetch", "--all", "origin"], cwd=local_dir, env=git_env)
 
-    return archived
+    return FetchResult(archived, skipped)
 
 
 def backup_account(args, output_directory):

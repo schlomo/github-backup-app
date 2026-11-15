@@ -83,7 +83,10 @@ def env():
 
 
 def fetch(upstream, mirror, env, **kwargs):
-    return gb.fetch_repository("r", f"file://{upstream}", str(mirror), env, **kwargs)
+    """Returns the number of archived refs."""
+    return gb.fetch_repository(
+        "r", f"file://{upstream}", str(mirror), env, **kwargs
+    ).archived
 
 
 # --- Mirror layout ------------------------------------------------------------
@@ -201,12 +204,58 @@ def test_archive_refs_survive_later_runs_and_gc(upstream, tmp_path, env):
     git("cat-file", "-e", archived[0] + "^{commit}", cwd=mirror)
 
 
-def test_no_prune_keeps_deleted_branch_in_place(upstream, tmp_path, env):
+def test_unchanged_remote_skips_fetch(upstream, tmp_path, env):
     mirror = tmp_path / "mirror"
     fetch(upstream, mirror, env)
+    url = f"file://{upstream}"
+    assert gb.fetch_repository("r", url, str(mirror), env).skipped
+    assert not gb.fetch_repository("r", url, str(mirror), env, force=True).skipped
+
+
+def test_pr_head_change_alone_triggers_fetch(upstream, tmp_path, env):
+    """A fork pushing to its PR does not touch the repository's branches
+    (nor its pushed_at); only refs/pull/<n>/head moves."""
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    git("checkout", "-q", "--detach", cwd=upstream)
+    fork_commit = commit(upstream, "pushed to the fork")
+    git("checkout", "-q", "main", cwd=upstream)
+    git("update-ref", "refs/pull/1/head", fork_commit, cwd=upstream)
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(mirror), env)
+
+    assert not result.skipped
+    assert refs(mirror)["refs/pull/1/head"] == fork_commit
+
+
+def test_default_branch_change_without_push_updates_head(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    git("symbolic-ref", "HEAD", "refs/heads/feature", cwd=upstream)
+    assert gb.fetch_repository("r", f"file://{upstream}", str(mirror), env).skipped
+    assert git("symbolic-ref", "HEAD", cwd=mirror) == "refs/heads/feature"
+
+
+def test_pending_journal_is_settled_even_when_fetch_is_skipped(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    gb._write_journal(str(mirror), gb._list_mirrored_refs(str(mirror)))
+    hotfix = refs(mirror)["refs/heads/hotfix"]
+    git("update-ref", "-d", "refs/heads/hotfix", cwd=mirror)  # killed mid-prune
     git("branch", "-D", "hotfix", cwd=upstream)
-    assert fetch(upstream, mirror, env, no_prune=True) == 0
-    assert "refs/heads/hotfix" in refs(mirror)
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(mirror), env)
+
+    assert result.skipped and result.archived == 1
+    assert hotfix in archived(mirror)
+    assert not (mirror / gb.REF_JOURNAL).exists()
+
+
+def test_no_prune_flag_is_accepted_and_ignored(tmp_path):
+    args = gb.parse_args(
+        ["--app-id", "1", "--private-key", "k", "--no-prune", "--bare"]
+    )
+    assert args.no_prune and args.bare_clone
 
 
 def test_restore_roundtrip(upstream, tmp_path, env):
@@ -238,12 +287,9 @@ def test_restore_roundtrip(upstream, tmp_path, env):
 
 def test_missing_optional_remote_is_skipped(tmp_path, env):
     target = tmp_path / "wiki"
-    assert (
-        gb.fetch_repository(
-            "w", f"file://{tmp_path}/nope", str(target), env, optional=True
-        )
-        == 0
-    )
+    assert gb.fetch_repository(
+        "w", f"file://{tmp_path}/nope", str(target), env, optional=True
+    ) == (0, True)
     assert not target.exists()
 
 
@@ -572,20 +618,24 @@ def test_loop_counts_archived_refs(loop, upstream):
     assert stats["git_refs_archived"] == 1
 
 
-def test_loop_migrates_and_scrubs_token_even_when_git_is_skipped(
-    loop, upstream, tmp_path
-):
+def test_loop_migrates_legacy_clone_then_skips_unchanged_git(loop, upstream, tmp_path):
     repo_cwd = tmp_path / "out" / "o" / "repositories" / "r"
     git("clone", "-q", f"file://{upstream}", str(repo_cwd / "repository"))
     git("config", "remote.origin.url", TOKEN_URL, cwd=repo_cwd / "repository")
-    (repo_cwd / gb.REPO_METADATA_FILENAME).write_text(json.dumps({"pushed_at": "same"}))
 
-    stats, _ = loop(f"file://{upstream}", _repository("same"))
-
-    assert stats["repositories_git_skipped_unchanged"] == 1
+    # First run: migrates, scrubs the token, fetches what the old clone
+    # lacked (PR heads).
+    stats, _ = loop(f"file://{upstream}", _repository())
     mirror = repo_cwd / "repository"
+    assert stats["repositories_succeeded"] == 1
+    assert stats["repositories_git_skipped_unchanged"] == 0
     assert git("rev-parse", "--is-bare-repository", cwd=mirror) == "true"
     assert files_containing(mirror, FAKE_TOKEN) == []
+    assert "refs/pull/1/head" in refs(mirror)
+
+    # Second run: nothing changed on GitHub.
+    stats, _ = loop(f"file://{upstream}", _repository())
+    assert stats["repositories_git_skipped_unchanged"] == 1
 
 
 # --- Environment --------------------------------------------------------------
