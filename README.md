@@ -339,9 +339,12 @@ second run exits with code 3 and leaves `status.json` alone. Stalled transfers
 redirects, so the token cannot be sent to another host.
 
 **Not backed up:** refs outside `refs/heads`, `refs/tags`, `refs/notes` and
-`refs/pull/*/head` (e.g. custom namespaces some tools push). Old `--bare`
-mirrors keep such refs from before the upgrade, but they are no longer
-updated.
+`refs/pull/*/head`. On GitHub these only exist when someone pushes them
+deliberately, e.g. `git push --mirror` from a working copy (which also pushes
+`refs/remotes/*` and `refs/stash`), or tools that keep data in their own
+namespace (git-bug: `refs/bugs/*`, Gerrit mirrors: `refs/changes/*`). The log
+warns for every repository that has such refs. Old `--bare` mirrors keep them
+from before the upgrade, but they are no longer updated.
 
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
@@ -350,11 +353,13 @@ process (requires git >= 2.31, checked at startup). It never appears in
 a plain `https://github.com/<owner>/<repo>.git`. Git LFS uses the same header
 for its API; LFS storage on other hosts does not receive it.
 
-**Ownership.** Like git's "dubious ownership" check, the backup refuses
-repositories owned by another user. Run the backup as the user that owns the
-backup directory (for Docker: `--user <uid>` matching the volume). For shares
-that report a fixed owner (some NAS/SMB mounts), allow the directory with
-git's `safe.directory` setting. `safe.bareRepository=explicit` is supported.
+**File ownership does not matter.** git is always pointed at each mirror
+explicitly, so git's "dubious ownership" check does not apply and the backup
+works regardless of which user owns the files (e.g. NAS shares with a fixed
+owner). The user running the backup only needs read and write access;
+permission errors fail the repository, they never move a backup aside. git
+hooks are disabled for every git call, so files planted in a mirror's `hooks/`
+directory never run. `safe.bareRepository=explicit` is supported.
 
 **Restore** a repository into a new, empty GitHub repository:
 

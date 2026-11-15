@@ -2644,11 +2644,6 @@ class GitCommandError(Exception):
     pass
 
 
-class GitOwnershipError(GitCommandError):
-    """The backup is owned by another user. Never "repaired" by a fresh
-    clone: that would duplicate every repository after a wrong --user."""
-
-
 class BrokenBackupError(Exception):
     """The local backup of a repository is unusable (failed integrity check,
     unfinishable migration, not a git repository). fetch_repository moves it
@@ -2681,11 +2676,13 @@ def _git(git_args, cwd=None, env=None, check=True, git_dir=None):
     back to git.
 
     git_dir is passed explicitly instead of being discovered from the working
-    directory: that works with `safe.bareRepository=explicit` and never picks
-    up a repository in a parent directory. It also bypasses git's own
-    ownership check, which _check_ownership therefore does instead.
+    directory: that works with `safe.bareRepository=explicit`, never picks up
+    a repository in a parent directory, and makes file ownership of the
+    backup irrelevant (git's "dubious ownership" check does not apply).
+    Hooks are always disabled: a backup never needs them, and nobody who can
+    write to the backup disk can make the backup run code through them.
     """
-    command = ["git"]
+    command = ["git", "-c", f"core.hooksPath={os.devnull}"]
     if git_dir is not None:
         command.append(f"--git-dir={git_dir}")
         cwd = cwd or git_dir
@@ -2763,31 +2760,6 @@ def _is_git_dir(path):
             f"{result.returncode}: {result.stderr.strip()}"
         )
     return os.path.realpath(result.stdout.strip()) == os.path.realpath(path)
-
-
-def _check_ownership(path):
-    """Refuse a backup owned by another user, as git's "dubious ownership"
-    check would (it does not apply with an explicit --git-dir). Directories
-    allowed by git's safe.directory setting are accepted, e.g. NAS shares
-    that report a fixed owner."""
-    if not hasattr(os, "geteuid") or os.stat(path).st_uid == os.geteuid():
-        return
-    allowed = _git(
-        ["config", "--get-all", "safe.directory"], cwd=os.sep, check=False
-    ).stdout.splitlines()
-    real = os.path.realpath(path)
-    for entry in (e.strip() for e in allowed):
-        if entry == "*" or (entry and os.path.realpath(entry) == real):
-            return
-        if entry.endswith("/*") and real.startswith(
-            os.path.realpath(entry[:-2]) + os.sep
-        ):
-            return
-    raise GitOwnershipError(
-        f"{path} is owned by a different user than the one running the backup; "
-        "run the backup as the owner of the backup directory (e.g. docker run "
-        "--user), or allow it with git's safe.directory setting"
-    )
 
 
 def _list_refs(git_dir, *patterns):
@@ -3170,13 +3142,6 @@ def ensure_mirror_repository(local_dir, remote_url):
 
     Returns True if local_dir is a mirror afterwards.
     """
-    for path in (
-        local_dir,
-        os.path.join(local_dir, ".git"),
-        local_dir + MIGRATION_SUFFIX,
-    ):
-        if os.path.exists(path):
-            _check_ownership(path)
     if os.path.isdir(os.path.join(local_dir, ".git")) or os.path.isdir(
         local_dir + MIGRATION_SUFFIX
     ):
@@ -3193,22 +3158,25 @@ def _remote_missing(stderr):
 
 
 def _parse_ls_remote(output):
-    """Return (default branch ref or None, {mirrored refname: object id})."""
+    """Return (default branch ref or None, {mirrored refname: object id},
+    [refs on GitHub this backup does not cover])."""
     default_ref = None
     remote = {}
+    not_covered = []
     for line in output.splitlines():
         if line.startswith("ref: ") and line.endswith("\tHEAD"):
             default_ref = line[len("ref: ") : -len("\tHEAD")]
             continue
         sha, _, ref = line.partition("\t")
-        if ref.endswith("^{}") or not ref.startswith(
-            tuple(f"{ns}/" for ns in MIRRORED_REF_NAMESPACES)
-        ):
+        if ref == "HEAD" or ref.endswith("^{}"):
+            continue
+        if not ref.startswith(tuple(f"{ns}/" for ns in MIRRORED_REF_NAMESPACES)):
+            not_covered.append(ref)
             continue
         if ref.startswith("refs/pull/") and not ref.endswith("/head"):
-            continue
+            continue  # GitHub's synthetic merge commits, deliberately skipped
         remote[ref] = sha
-    return default_ref, remote
+    return default_ref, remote, not_covered
 
 
 FetchResult = namedtuple(
@@ -3306,7 +3274,13 @@ def _fetch_repository(
             f"git ls-remote {remote_url} failed with exit code "
             f"{listing.returncode}: {listing.stderr.strip()}"
         )
-    default_ref, remote_refs = _parse_ls_remote(listing.stdout)
+    default_ref, remote_refs, not_covered = _parse_ls_remote(listing.stdout)
+    if not_covered:
+        logger.warning(
+            f"{name} has {len(not_covered)} ref(s) outside "
+            f"{', '.join(MIRRORED_REF_NAMESPACES)} that are not backed up, e.g. "
+            f"{', '.join(not_covered[:5])}"
+        )
 
     try:
         return _update_mirror(
@@ -3319,8 +3293,6 @@ def _fetch_repository(
             lfs_clone,
             force,
         )
-    except GitOwnershipError:
-        raise
     except GitCommandError as e:
         # GitHub answered ls-remote moments ago, so a git failure on an
         # existing backup that also fails its integrity check is local.

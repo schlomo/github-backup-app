@@ -28,6 +28,9 @@ def git(*args, cwd=None):
             "user.name=t",
             "-c",
             "init.defaultBranch=main",
+            # The helper inspects backups owned by other test uids too.
+            "-c",
+            "safe.directory=*",
             *args,
         ],
         cwd=cwd,
@@ -44,6 +47,18 @@ def refs(repo):
 
 def archived(repo):
     return {s for n, s in refs(repo).items() if n.startswith("refs/backup/")}
+
+
+def lock_branch(mirror, branch):
+    """Make every update of one branch fail, as a full disk or a stuck
+    process would (works without hooks, which the backup disables)."""
+    (mirror / "refs" / "heads" / f"{branch}.lock").write_text("")
+
+
+def drop_object(repo, sha):
+    """Remove a loose object: the remote still advertises its refs, but
+    serving them fails."""
+    os.remove(os.path.join(repo, ".git", "objects", sha[:2], sha[2:]))
 
 
 def commit(repo, message):
@@ -310,10 +325,7 @@ def test_optional_remote_failing_after_backup_exists_raises(upstream, tmp_path, 
 def test_failing_fetch_raises_instead_of_being_ignored(upstream, tmp_path, env):
     mirror = tmp_path / "mirror"
     fetch(upstream, mirror, env)
-    # Make every ref update in the mirror fail, as a full disk would.
-    hook = mirror / "hooks" / "reference-transaction"
-    hook.write_text("#!/bin/sh\nexit 1\n")
-    hook.chmod(0o755)
+    lock_branch(mirror, "main")
     commit(upstream, "new")
     with pytest.raises(gb.GitCommandError, match="fetch"):
         fetch(upstream, mirror, env)
@@ -414,18 +426,6 @@ def test_full_backup_leaves_no_token_on_disk_or_in_status(
     assert stats["repositories_succeeded"] == 1
     assert files_containing(tmp_path / "out", FAKE_TOKEN) == []
     assert FAKE_TOKEN not in json.dumps(stats)
-
-
-def test_dubious_ownership_is_reported_clearly(upstream, tmp_path, env):
-    if os.geteuid() != 0:
-        pytest.skip("needs root to chown")
-    mirror = tmp_path / "mirror"
-    fetch(upstream, mirror, env)
-    for root, dirs, files in os.walk(mirror):
-        for entry in [root, *(os.path.join(root, f) for f in files)]:
-            os.chown(entry, 12345, 12345)
-    with pytest.raises(gb.GitCommandError, match="owned by a different user"):
-        fetch(upstream, mirror, env)
 
 
 def test_lightweight_tag_moved_forward_is_archived(upstream, tmp_path, env):
@@ -790,18 +790,8 @@ def test_fetch_failing_after_prune_still_archives_deleted_refs(upstream, tmp_pat
     git("checkout", "-q", "main", cwd=upstream)
     mirror = tmp_path / "mirror"
     fetch(upstream, mirror, env)
-    # Deletions (prune) and archive refs succeed, any other ref update fails:
-    # git prunes first, then the transfer/update fails.
-    hook = mirror / "hooks" / "reference-transaction"
-    hook.write_text(
-        "#!/bin/sh\n"
-        '[ "$1" = prepared ] || exit 0\n'
-        "while read old new ref; do\n"
-        '  case "$ref" in refs/backup/*) continue;; esac\n'
-        '  [ "$new" = "$(printf %040d 0)" ] || exit 1\n'
-        "done\n"
-    )
-    hook.chmod(0o755)
+    # git prunes hotfix first, then updating main fails.
+    lock_branch(mirror, "main")
     git("branch", "-D", "hotfix", cwd=upstream)
     commit(upstream, "new")
 
@@ -816,11 +806,7 @@ def test_fetch_failing_after_prune_still_archives_deleted_refs(upstream, tmp_pat
 
 def test_failed_first_fetch_leaves_no_mirror_behind(upstream, tmp_path, env):
     mirror = tmp_path / "mirror"
-    hook_dir = tmp_path / "hooks"
-    hook_dir.mkdir()
-    (hook_dir / "reference-transaction").write_text("#!/bin/sh\nexit 1\n")
-    (hook_dir / "reference-transaction").chmod(0o755)
-    env = dict(env, GIT_CONFIG_PARAMETERS=f"'core.hooksPath={hook_dir}'")
+    drop_object(upstream, commit(upstream, "cannot be served"))
     with pytest.raises(gb.GitCommandError):
         fetch(upstream, mirror, env)
     assert not mirror.exists()
@@ -980,19 +966,6 @@ def test_remote_failure_never_moves_a_backup_aside(upstream, tmp_path, env):
     assert mirror.is_dir()
 
 
-def test_ownership_problem_never_moves_a_backup_aside(upstream, tmp_path, env):
-    if os.geteuid() != 0:
-        pytest.skip("needs root to chown")
-    mirror = tmp_path / "mirror"
-    fetch(upstream, mirror, env)
-    for root, dirs, files in os.walk(mirror):
-        for entry in [root, *(os.path.join(root, f) for f in files)]:
-            os.chown(entry, 12345, 12345)
-    with pytest.raises(gb.GitOwnershipError):
-        fetch(upstream, mirror, env)
-    assert _quarantined(mirror) == []
-
-
 def test_loop_reports_recovered_repository_as_success(loop, upstream, tmp_path):
     repo_cwd = tmp_path / "out" / "o" / "repositories" / "r"
     legacy = repo_cwd / "repository"
@@ -1031,32 +1004,6 @@ def test_renamed_default_branch_does_not_move_legacy_clone_aside(
     assert result.recovered is None and _quarantined(legacy) == []
     assert reflog_only in archived(legacy) and dangling in archived(legacy)
     assert "refs/heads/trunk" in refs(legacy)
-
-
-def test_legacy_clone_of_other_owner_is_refused_not_moved_aside(
-    upstream, legacy_clone, env
-):
-    if os.geteuid() != 0:
-        pytest.skip("needs root to chown")
-    legacy, _, _ = legacy_clone
-    _chown_tree(legacy, 12345)
-    with pytest.raises(gb.GitOwnershipError):
-        gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
-    assert _quarantined(legacy) == [] and (legacy / ".git").is_dir()
-
-
-def test_safe_directory_allows_other_owner(upstream, tmp_path, env, monkeypatch):
-    if os.geteuid() != 0:
-        pytest.skip("needs root to chown")
-    mirror = tmp_path / "mirror"
-    fetch(upstream, mirror, env)
-    _chown_tree(mirror, 12345)
-    config = tmp_path / "gitconfig"
-    config.write_text(f"[safe]\n\tdirectory = {mirror}\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    commit(upstream, "new")
-    fetch(upstream, mirror, dict(os.environ))
-    assert refs(mirror)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
 
 
 def test_unreadable_repository_format_fails_without_moving_aside(
@@ -1283,3 +1230,46 @@ def test_only_evidence_of_damage_counts_as_broken(
         gb._fsck(str(tmp_path), "repo")
     assert type(err.value) is expected
     assert "dangling" not in str(err.value)
+
+
+# --- File ownership does not matter; hooks never run --------------------------
+
+
+def test_backup_owned_by_another_user_just_works(upstream, legacy_clone, env):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to chown")
+    legacy, _, _ = legacy_clone
+    _chown_tree(legacy, 12345)
+    result = gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+    assert result.recovered is None and _quarantined(legacy) == []
+    _chown_tree(legacy, 12345)
+    commit(upstream, "new")
+    fetch(upstream, legacy, env)
+    assert refs(legacy)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
+
+
+def test_hooks_in_a_backup_never_run(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    marker = tmp_path / "hook-ran"
+    for hook in ("reference-transaction", "post-index-change"):
+        path = mirror / "hooks" / hook
+        path.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        path.chmod(0o755)
+    git("branch", "-D", "hotfix", cwd=upstream)
+    commit(upstream, "new")
+    assert fetch(upstream, mirror, env) == 1
+    assert not marker.exists()
+
+
+def test_refs_outside_the_mirrored_namespaces_are_reported(
+    upstream, tmp_path, env, caplog
+):
+    git("update-ref", "refs/bugs/1", "main", cwd=upstream)
+    git("update-ref", "refs/remotes/origin/main", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    with caplog.at_level("WARNING"):
+        fetch(upstream, mirror, env)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("2 ref(s)" in w and "refs/bugs/1" in w for w in warnings)
+    assert not any("refs/pull/1/merge" in w for w in warnings)

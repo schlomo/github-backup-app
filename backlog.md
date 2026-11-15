@@ -76,14 +76,16 @@ From the second adversarial review (not fixed in 0.4.0):
 - **First clones cannot resume.** A failed first clone is discarded
   (`repository.new-mirror/`) and starts over on the next run; a very large
   repository on a flaky connection may never finish.
-- **Refs outside heads/tags/notes/pull** are not backed up (documented).
-  Fetching `+refs/*:refs/*` needs a way to keep `--prune` away from the
+- **Refs outside heads/tags/notes/pull** are not backed up (documented, and
+  logged as a warning per repository). If the warning shows up in practice:
+  fetching `+refs/*:refs/*` needs a way to keep `--prune` away from the
   archive refs first.
 - **Case-insensitive filesystems** (some NAS/SMB mounts, macOS): refs that
   differ only in case make the fetch fail on every run (loudly).
 - **A wiki that was never backed up** is skipped when GitHub answers "not
   found", which GitHub also says for some permission problems.
-- **Ownership tests need root** and are skipped on GitHub-hosted CI.
+- **Tests that change file ownership need root** and are skipped on
+  GitHub-hosted CI.
 
 - **Archive refs are kept forever.** `refs/backup/*` grows with every
   deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
