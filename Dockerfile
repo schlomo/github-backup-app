@@ -42,4 +42,7 @@ USER appuser
 
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Fail the image build if the distribution's git is too old for the tool.
+RUN python -c "from github_backup.github_backup import check_git_version as c; print(c())"
+
 ENTRYPOINT ["github-backup"]
