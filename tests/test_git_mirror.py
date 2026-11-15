@@ -550,8 +550,11 @@ def test_migration_leaves_corrupt_clone_untouched(upstream, legacy_clone):
     for pack in (legacy / ".git" / "objects" / "pack").glob("*.pack"):
         os.chmod(pack, 0o644)
         pack.write_bytes(b"")  # ... and destroy the pack
-    with pytest.raises(Exception, match="left untouched"):
+    with pytest.raises(Exception, match="left untouched") as err:
         gb.ensure_mirror_repository(str(legacy), f"file://{upstream}")
+    # The real problem is reported, not the expected dangling commits.
+    assert "dangling" not in str(err.value)
+    assert "error" in str(err.value) or "fatal" in str(err.value)
     assert (legacy / ".git").is_dir()
     assert refs(legacy)["refs/remotes/origin/main"] == main
 

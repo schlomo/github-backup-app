@@ -2837,9 +2837,16 @@ def _rescue_unreferenced(git_dir, label, what):
         check=False,
     )
     if fsck.returncode != 0:
+        # Dangling objects are expected here; report only the real problems.
+        problems = fsck.stderr.splitlines() + [
+            line
+            for line in fsck.stdout.splitlines()
+            if not line.startswith("dangling ")
+        ]
         raise Exception(
-            f"Not migrating {what}: git fsck reports problems, it was left "
-            f"untouched: {(fsck.stdout + fsck.stderr).strip()[:500]}"
+            f"Not migrating {what}: git fsck reports problems (exit code "
+            f"{fsck.returncode}), it was left untouched: "
+            + "; ".join(line.strip() for line in problems if line.strip())[:1000]
         )
     unreferenced = []
     for line in fsck.stdout.splitlines():
