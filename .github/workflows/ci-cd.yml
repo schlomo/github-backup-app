@@ -32,11 +32,15 @@ jobs:
 
     - name: Lint with flake8
       run: |
-        uv run flake8 github_backup/
+        uv run flake8 github_backup/ tests/
 
     - name: Check code formatting with black
       run: |
-        uv run black --check github_backup/
+        uv run black --check github_backup/ tests/
+
+    - name: Run tests
+      run: |
+        uv run pytest -q tests/
 
     - name: Test import
       run: |

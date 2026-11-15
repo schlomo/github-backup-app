@@ -8,7 +8,7 @@ This project is a fork of [python-backup](https://github.com/josegonzalez/python
 
 ## What This Tool Does
 
-- **Git repositories** — full clones, with automatic skip when `pushed_at` is unchanged
+- **Git repositories** — bare mirrors of all branches, tags and pull-request heads; deleted or force-pushed refs are archived, never lost; automatic skip when `pushed_at` is unchanged
 - **JSON metadata** — issues, pull requests, comments, milestones, labels, hooks, releases
 - **Organized storage** — `{output}/{owner}/repositories/{repo}/…` mirrors GitHub's structure
 - **GitHub App auth** — one app, many installations; no personal access tokens or SSH keys to rotate
@@ -221,7 +221,8 @@ backup/
 │   └── repositories/
 │       ├── repo1/
 │       │   ├── repo.json            # Repository metadata (also drives incremental skip)
-│       │   ├── repository/          # Git clone
+│       │   ├── repository/          # Bare git mirror (see "Git repositories")
+│       │   ├── wiki/                # Bare git mirror of the wiki (if any)
 │       │   ├── issues/              # JSON files
 │       │   ├── pulls/               # JSON files
 │       │   └── milestones/          # JSON files
@@ -279,6 +280,77 @@ catching exactly the kind of silent, long-running breakage that a simple
 "did it run?" check would miss. The non-zero exit codes above also let cron/CI
 detect failures directly.
 
+### Git repositories
+
+Each repository (and wiki) is stored as a **bare mirror** under `repository/`
+(`wiki/`). A mirror contains:
+
+| Ref | Content |
+|-----|---------|
+| `refs/heads/*` | every branch, exactly as on GitHub |
+| `refs/tags/*` | every tag |
+| `refs/pull/<n>/head` | the head of every pull request, including PRs from forks whose commits exist nowhere else in the repository |
+| `refs/backup/<timestamp>/<ref>` | refs that GitHub **deleted or force-moved** since the previous run, preserved at their old commit |
+
+GitHub's synthetic `refs/pull/<n>/merge` commits are not backed up.
+
+**Nothing is silently destroyed.** Before a fetch updates the mirror, every
+branch, tag and PR head that disappeared on GitHub or moved in a way that drops
+commits (force-push) is copied to `refs/backup/<UTC timestamp>/<original ref>`.
+The mirror's `refs/heads` and `refs/tags` therefore always equal GitHub's
+current state, while the rewritten history stays reachable (and is never
+garbage collected). `status.json` counts these in `git_refs_archived`.
+`--no-prune` keeps deleted refs in place instead of archiving them.
+
+**No credentials on disk.** The GitHub App installation token is passed to git
+as an HTTP header through `GIT_CONFIG_*` environment variables of each git
+process. It never appears in `.git/config`, on the command line (`ps`) or in
+logs; the stored remote URL is a plain `https://github.com/<owner>/<repo>.git`.
+
+**Restore** a repository into a new, empty GitHub repository:
+
+```bash
+git -C backup/<owner>/repositories/<repo>/repository push <new-remote-url> \
+  'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+```
+
+Do not use `git push --mirror`: GitHub rejects pushes to `refs/pull/*`. To look
+at the code, `git clone backup/<owner>/repositories/<repo>/repository` gives a
+normal working copy. To recover archived history, list it with
+`git for-each-ref refs/backup` and push the ones you need as branches.
+
+**Upgrading from 0.3.0 and earlier.** Older versions stored a non-bare clone
+(branches only as `refs/remotes/origin/*`, with the access token in the remote
+URL) or, with `--bare`, a `git clone --mirror`. Both are converted in place on
+the next run, also for repositories whose fetch is skipped. `--bare` is now a
+no-op. The migration is designed to lose nothing:
+
+- No git object is copied, rewritten or deleted; the old `.git` directory
+  *becomes* the mirror. Only the checked-out working tree (whose content is in
+  git) is removed, and only after verifying that every branch was carried over.
+- Every remote-tracking branch becomes a real branch at the same commit.
+- Commits that the old layout only kept by accident are rescued as refs:
+  tips force-pushed away (still in the old reflogs) under
+  `refs/backup/<ts>-migration-reflog/`, and commits of branches an earlier
+  `--prune` deleted but not yet garbage collected under
+  `refs/backup/<ts>-migration-dangling/`.
+- A clone that fails `git fsck` is left untouched and the repository is
+  reported as failed in `status.json`.
+- Each step is idempotent: an interrupted run (Ctrl-C, container killed)
+  resumes the migration on the next run (`repository.mirror-migration/` is
+  the in-progress state).
+- The token-bearing remote URL is replaced by a clean one.
+
+Recommended procedure: take a filesystem snapshot of the backup directory
+(e.g. Btrfs/ZFS snapshot on a NAS), run once, check `status.json` for
+`repositories_failed`, then verify with
+`grep -rl ghs_ <backup-dir> --include=config` (expect no output). Do not roll
+back to 0.3.0 afterwards without its `--bare` flag: without it, 0.3.0 does not
+recognise the mirrors and silently stops backing up git content.
+
+**LFS** (`--lfs`): `git lfs fetch --all` runs after every fetch and covers all
+refs including the archive; LFS objects are never pruned.
+
 ### Incremental backups
 
 Incremental backups are automatic; there is no flag to enable them and no
@@ -292,7 +364,9 @@ doubles as the incremental signal. On the next run, if a repository's current
 `pushed_at` (from the GitHub API) matches the value stored in `repo.json` **and**
 a local clone already exists, the (often dominant) `git fetch` is skipped.
 `pushed_at` changes on every push (including tags and force-pushes), so this is
-always safe. `repo.json` is refreshed on every successful run, so metadata stays
+safe for branches and tags. Pull-request heads of PRs from forks change
+without a push to the repository itself; they are picked up the next time the
+repository is fetched. `repo.json` is refreshed on every successful run, so metadata stays
 current even when the git fetch is skipped.
 
 **Issues, pull requests and milestones** — for each item, its stored
@@ -356,8 +430,9 @@ source .venv/bin/activate
 
 Then you can use the tools directly:
 ```bash
-flake8 github_backup/                 # Run linting
-black github_backup/                  # Format code
+pytest -q tests/                      # Run tests (local git repos, no network)
+flake8 github_backup/ tests/          # Run linting
+black github_backup/ tests/           # Format code
 python -c "import github_backup; print('Import successful')"  # Test import
 github-backup --help                  # Show CLI help
 uv build                              # Build package
