@@ -61,7 +61,10 @@ def main():
             logger.info("Creating output directory {0}".format(output_directory))
             mkdir_p(output_directory)
 
-        if not args.dry_run:
+        uses_git = (
+            args.include_repository or args.include_wiki or args.include_everything
+        )
+        if uses_git and not args.dry_run:
             logger.info(f"Using {check_git_version()}")
         if args.lfs_clone:
             check_git_lfs_install()

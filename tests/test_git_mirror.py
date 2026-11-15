@@ -42,6 +42,10 @@ def refs(repo):
     return {name: sha for name, sha in (line.split(" ") for line in out.splitlines())}
 
 
+def archived(repo):
+    return {s for n, s in refs(repo).items() if n.startswith("refs/backup/")}
+
+
 def commit(repo, message):
     git("commit", "-q", "--allow-empty", "-m", message, cwd=repo)
     return git("rev-parse", "HEAD", cwd=repo)
@@ -285,19 +289,21 @@ def test_auth_env_carries_token_as_scoped_header(fake_auth, monkeypatch):
     env = gb.get_git_auth_env(args, {"_installation_id": 1})
 
     basic = base64.b64encode(f"x-access-token:{FAKE_TOKEN}".encode()).decode()
-    assert env["GIT_CONFIG_COUNT"] == "2"
+    key = "http.https://github.com/.extraHeader"
+    assert env["GIT_CONFIG_COUNT"] == "3"
     assert env["GIT_CONFIG_KEY_0"] == "user.name"
-    assert env["GIT_CONFIG_KEY_1"] == "http.https://github.com/.extraHeader"
-    assert env["GIT_CONFIG_VALUE_1"] == f"Authorization: Basic {basic}"
+    assert (env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]) == (key, "")
+    assert env["GIT_CONFIG_KEY_2"] == key
+    assert env["GIT_CONFIG_VALUE_2"] == f"Authorization: Basic {basic}"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
-def test_git_sends_auth_header_and_never_persists_it(fake_auth, tmp_path):
+def test_git_sends_exactly_one_auth_header(fake_auth, tmp_path, monkeypatch):
     seen = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            seen.append(self.headers.get("Authorization"))
+            seen.append(self.headers.get_all("Authorization"))
             self.send_response(404)
             self.end_headers()
 
@@ -307,26 +313,87 @@ def test_git_sends_auth_header_and_never_persists_it(fake_auth, tmp_path):
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     host = f"127.0.0.1:{server.server_port}"
+    # A conflicting header in the global config (as on some CI hosts) must
+    # not lead to a second Authorization header.
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text(
+        f'[http "http://{host}/"]\n\textraHeader = Authorization: Basic stale\n'
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
     try:
         args = gb.argparse.Namespace(github_host=host)
         env = gb.get_git_auth_env(args, {"_installation_id": 1})
-        # The production header is scoped to https://; the test server is http.
-        key = f"GIT_CONFIG_KEY_{int(env['GIT_CONFIG_COUNT']) - 1}"
-        env[key] = f"http.http://{host}/.extraHeader"
-        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            env.pop(var, None)
-        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1"
+        # The production header is scoped to https://; the test server is
+        # plain http, so re-scope both entries (reset and header).
+        for i in range(int(env["GIT_CONFIG_COUNT"])):
+            if env[f"GIT_CONFIG_KEY_{i}"].endswith(".extraHeader"):
+                env[f"GIT_CONFIG_KEY_{i}"] = f"http.http://{host}/.extraHeader"
         with pytest.raises(gb.GitCommandError) as err:
             gb.fetch_repository("r", f"http://{host}/o/r.git", str(tmp_path / "m"), env)
     finally:
         server.shutdown()
 
     basic = base64.b64encode(f"x-access-token:{FAKE_TOKEN}".encode()).decode()
-    assert seen and set(seen) == {f"Basic {basic}"}
+    assert seen and all(headers == [f"Basic {basic}"] for headers in seen)
     assert FAKE_TOKEN not in str(err.value)
-    assert not (tmp_path / "m").exists() or not files_containing(
-        tmp_path / "m", FAKE_TOKEN
+
+
+def test_full_backup_leaves_no_token_on_disk_or_in_status(
+    fake_auth, upstream, tmp_path, monkeypatch
+):
+    """Uses the real get_git_auth_env; file:// ignores the header, but every
+    file written by migration, fetch and the loop is checked for the token."""
+    repo_cwd = tmp_path / "out" / "o" / "repositories" / "r"
+    legacy = repo_cwd / "repository"
+    git("clone", "-q", f"file://{upstream}", str(legacy))
+    git("config", "remote.origin.url", TOKEN_URL, cwd=legacy)
+    monkeypatch.setattr(gb, "get_github_repo_url", lambda a, r: f"file://{upstream}")
+    commit(upstream, "new")
+
+    stats = gb.backup_repositories(
+        _loop_args(tmp_path), str(tmp_path / "out"), [_repository("new")]
     )
+
+    assert stats["repositories_succeeded"] == 1
+    assert files_containing(tmp_path / "out", FAKE_TOKEN) == []
+    assert FAKE_TOKEN not in json.dumps(stats)
+
+
+def test_dubious_ownership_is_reported_clearly(upstream, tmp_path, env):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to chown")
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    for root, dirs, files in os.walk(mirror):
+        for entry in [root, *(os.path.join(root, f) for f in files)]:
+            os.chown(entry, 12345, 12345)
+    with pytest.raises(gb.GitCommandError, match="owned by a different user"):
+        fetch(upstream, mirror, env)
+
+
+def test_lightweight_tag_moved_forward_is_archived(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    old = refs(mirror)["refs/tags/v1"]
+    commit(upstream, "newer")
+    git("tag", "-f", "v1", cwd=upstream)
+    assert fetch(upstream, mirror, env) == 1
+    assert old in archived(mirror)
+
+
+def test_wiki_failing_for_other_reasons_is_not_skipped(tmp_path, env):
+    with pytest.raises(gb.GitCommandError):
+        gb.fetch_repository(
+            "w",
+            "http://127.0.0.1:9/o/r.wiki.git",
+            str(tmp_path / "w"),
+            dict(env, NO_PROXY="127.0.0.1", no_proxy="127.0.0.1"),
+            optional=True,
+        )
 
 
 def test_clone_urls_have_no_credentials_and_handle_dotted_names():
@@ -559,3 +626,199 @@ def test_check_git_version_reports_missing_git(monkeypatch):
 
 def test_installed_git_is_supported():
     gb.check_git_version()
+
+
+# --- Regression tests from adversarial review ----------------------------------
+
+
+def _reachable_from_refs(repo, sha):
+    out = git("for-each-ref", "--contains", sha, "--format=%(refname)", cwd=repo)
+    return bool(out)
+
+
+def _object_has_ref(repo, sha):
+    """True if sha is referenced by a ref directly or reachable from one."""
+    names = git("for-each-ref", "--format=%(objectname)", cwd=repo).split()
+    return sha in names or _reachable_from_refs(repo, sha)
+
+
+def test_migration_keeps_tip_from_before_first_force_push(upstream, tmp_path):
+    legacy = tmp_path / "repository"
+    git("clone", "-q", f"file://{upstream}", str(legacy))
+    git("checkout", "-q", "feature", cwd=upstream)
+    first = commit(upstream, "f1")
+    git("fetch", "-q", "--all", "--force", "--tags", "--prune", cwd=legacy)
+    tips = [first]
+    for i in range(3):
+        git("reset", "-q", "--hard", "HEAD~1", cwd=upstream)
+        tips.append(commit(upstream, f"rewrite {i}"))
+        git("fetch", "-q", "--all", "--force", "--tags", "--prune", cwd=legacy)
+    git("checkout", "-q", "main", cwd=upstream)
+
+    gb.ensure_mirror_repository(str(legacy), f"file://{upstream}")
+
+    for sha in tips:
+        assert _object_has_ref(legacy, sha), sha
+
+
+def test_migration_rescues_commits_behind_dangling_annotated_tag(upstream, tmp_path):
+    legacy = tmp_path / "repository"
+    git("clone", "-q", f"file://{upstream}", str(legacy))
+    git("checkout", "-q", "--detach", cwd=upstream)
+    release_only = commit(upstream, "release-only commit")
+    git("tag", "-a", "-m", "r1", "rel", cwd=upstream)
+    git("checkout", "-q", "main", cwd=upstream)
+    git("fetch", "-q", "--all", "--force", "--tags", "--prune", cwd=legacy)
+    old_tag = refs(legacy)["refs/tags/rel"]
+    git("tag", "-f", "-a", "-m", "r1 again", "rel", "main", cwd=upstream)
+    git("fetch", "-q", "--all", "--force", "--tags", "--prune", cwd=legacy)
+
+    gb.ensure_mirror_repository(str(legacy), f"file://{upstream}")
+
+    assert _object_has_ref(legacy, old_tag)
+    assert _object_has_ref(legacy, release_only)
+
+
+def test_old_bare_mirror_pruned_commits_are_rescued(upstream, tmp_path, env):
+    old = tmp_path / "old"
+    git("clone", "-q", "--mirror", f"file://{upstream}", str(old))
+    git("checkout", "-q", "-b", "doomed", cwd=upstream)
+    doomed = commit(upstream, "doomed")
+    git("checkout", "-q", "main", cwd=upstream)
+    git("fetch", "-q", "--prune", cwd=old)
+    git("branch", "-D", "doomed", cwd=upstream)
+    git("fetch", "-q", "--prune", cwd=old)  # old version pruned it
+
+    fetch(upstream, old, env)
+
+    assert _object_has_ref(old, doomed)
+
+
+def test_rewritten_annotated_tag_on_same_commit_is_archived(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    old_tag = refs(mirror)["refs/tags/v2"]
+    git("tag", "-f", "-a", "-m", "re-signed", "v2", cwd=upstream)
+    assert fetch(upstream, mirror, env) == 1
+    assert old_tag in archived(mirror)
+
+
+def test_interrupted_archiving_is_completed_on_next_run(
+    upstream, tmp_path, env, monkeypatch
+):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    hotfix = refs(mirror)["refs/heads/hotfix"]
+    git("branch", "-D", "hotfix", cwd=upstream)
+
+    def killed(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m:
+        m.setattr(gb, "_archive_ref", killed)
+        with pytest.raises(KeyboardInterrupt):
+            fetch(upstream, mirror, env)
+    assert "refs/heads/hotfix" not in refs(mirror)  # fetch already pruned it
+
+    assert fetch(upstream, mirror, env) == 1
+    assert hotfix in archived(mirror)
+
+
+def test_fetch_failing_after_prune_still_archives_deleted_refs(upstream, tmp_path, env):
+    git("checkout", "-q", "hotfix", cwd=upstream)
+    hotfix = commit(upstream, "only on hotfix")
+    git("checkout", "-q", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    # Deletions (prune) and archive refs succeed, any other ref update fails:
+    # git prunes first, then the transfer/update fails.
+    hook = mirror / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = prepared ] || exit 0\n'
+        "while read old new ref; do\n"
+        '  case "$ref" in refs/backup/*) continue;; esac\n'
+        '  [ "$new" = "$(printf %040d 0)" ] || exit 1\n'
+        "done\n"
+    )
+    hook.chmod(0o755)
+    git("branch", "-D", "hotfix", cwd=upstream)
+    commit(upstream, "new")
+
+    with pytest.raises(gb.GitCommandError):
+        fetch(upstream, mirror, env)
+
+    got = refs(mirror)
+    assert "refs/heads/hotfix" not in got
+    archived = [n for n, sha in got.items() if sha == hotfix]
+    assert archived and all(n.startswith("refs/backup/") for n in archived)
+
+
+def test_failed_first_fetch_leaves_no_mirror_behind(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    hook_dir = tmp_path / "hooks"
+    hook_dir.mkdir()
+    (hook_dir / "reference-transaction").write_text("#!/bin/sh\nexit 1\n")
+    (hook_dir / "reference-transaction").chmod(0o755)
+    env = dict(env, GIT_CONFIG_PARAMETERS=f"'core.hooksPath={hook_dir}'")
+    with pytest.raises(gb.GitCommandError):
+        fetch(upstream, mirror, env)
+    assert not mirror.exists()
+
+
+def test_archive_never_overwrites_existing_archive(
+    upstream, tmp_path, env, monkeypatch
+):
+    monkeypatch.setattr(gb, "_archive_timestamp", lambda: "20260101T000000Z")
+    git("checkout", "-q", "feature", cwd=upstream)
+    a = commit(upstream, "a")
+    git("checkout", "-q", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    git("checkout", "-q", "feature", cwd=upstream)
+    git("reset", "-q", "--hard", "HEAD~1", cwd=upstream)
+    b = commit(upstream, "b")
+    git("checkout", "-q", "main", cwd=upstream)
+    fetch(upstream, mirror, env)
+    git("branch", "-f", "feature", "main", cwd=upstream)
+    fetch(upstream, mirror, env)
+
+    archived = [s for n, s in refs(mirror).items() if n.startswith("refs/backup/")]
+    assert a in archived and b in archived
+
+
+def test_wiki_with_interrupted_migration_is_not_silently_skipped(
+    upstream, tmp_path, env
+):
+    wiki = tmp_path / "wiki"
+    git("clone", "-q", f"file://{upstream}", str(wiki))
+    os.rename(wiki / ".git", str(wiki) + gb.MIGRATION_SUFFIX)
+    import shutil
+
+    shutil.rmtree(wiki)
+    with pytest.raises(gb.GitCommandError):
+        gb.fetch_repository(
+            "w", f"file://{tmp_path}/gone", str(wiki), env, optional=True
+        )
+
+
+def test_notes_are_mirrored(upstream, tmp_path, env):
+    git("notes", "add", "-m", "a note", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    assert "refs/notes/commits" in refs(mirror)
+
+
+def test_git_failure_does_not_block_metadata_backup(loop, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gb, "backup_labels", lambda *a, **k: calls.append("labels"))
+    monkeypatch.setattr(gb, "fetch_repository_metadata_graphql", lambda *a, **k: {})
+    monkeypatch.setattr(
+        gb,
+        "parse_args",
+        lambda argv, _orig=gb.parse_args: _orig([*argv, "--labels"]),
+    )
+    stats, repo_cwd = loop(f"file://{tmp_path}/nope", _repository())
+    assert calls == ["labels"]
+    assert stats["repositories_failed"] == 1
+    assert not (repo_cwd / gb.REPO_METADATA_FILENAME).exists()

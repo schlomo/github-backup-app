@@ -289,23 +289,42 @@ Each repository (and wiki) is stored as a **bare mirror** under `repository/`
 |-----|---------|
 | `refs/heads/*` | every branch, exactly as on GitHub |
 | `refs/tags/*` | every tag |
+| `refs/notes/*` | git notes |
 | `refs/pull/<n>/head` | the head of every pull request, including PRs from forks whose commits exist nowhere else in the repository |
 | `refs/backup/<timestamp>/<ref>` | refs that GitHub **deleted or force-moved** since the previous run, preserved at their old commit |
 
 GitHub's synthetic `refs/pull/<n>/merge` commits are not backed up.
 
-**Nothing is silently destroyed.** Before a fetch updates the mirror, every
-branch, tag and PR head that disappeared on GitHub or moved in a way that drops
-commits (force-push) is copied to `refs/backup/<UTC timestamp>/<original ref>`.
-The mirror's `refs/heads` and `refs/tags` therefore always equal GitHub's
-current state, while the rewritten history stays reachable (and is never
-garbage collected). `status.json` counts these in `git_refs_archived`.
+**Nothing is silently destroyed.** Every branch, PR head or note that
+disappeared on GitHub or moved in a way that drops commits (force-push), and
+every tag that changed at all, is preserved as
+`refs/backup/<UTC timestamp>/<original ref>`. The mirror's `refs/heads` and
+`refs/tags` therefore always equal GitHub's current state, while the rewritten
+history stays reachable (and is never garbage collected). Archive refs are
+never overwritten. `status.json` counts them in `git_refs_archived`.
 `--no-prune` keeps deleted refs in place instead of archiving them.
+
+This also holds when a run fails or is killed: before each fetch the current
+refs are written to a journal (`backup-refs-journal` inside the mirror), and
+whatever changed is archived after the fetch - successful or failed - or at
+the start of the next run. A first clone is built in `repository.new-mirror/`
+and only moved into place once it succeeded.
+
+**Known gap:** the git fetch is skipped while the repository's `pushed_at` is
+unchanged (see below). Pushes to a fork that update an open pull request most
+likely do not change the base repository's `pushed_at`, so such PR heads are
+only refreshed with the next push to the repository itself.
 
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
-process. It never appears in `.git/config`, on the command line (`ps`) or in
-logs; the stored remote URL is a plain `https://github.com/<owner>/<repo>.git`.
+process (requires git >= 2.31, checked at startup). It never appears in
+`.git/config`, on the command line (`ps`) or in logs; the stored remote URL is
+a plain `https://github.com/<owner>/<repo>.git`. Git LFS uses the same header
+for its API; LFS storage on other hosts does not receive it.
+
+**Ownership.** git refuses repositories owned by another user ("dubious
+ownership"). Run the backup as the user that owns the backup directory (for
+Docker: `--user <uid>` matching the volume).
 
 **Restore** a repository into a new, empty GitHub repository:
 
@@ -329,13 +348,15 @@ no-op. The migration is designed to lose nothing:
   *becomes* the mirror. Only the checked-out working tree (whose content is in
   git) is removed, and only after verifying that every branch was carried over.
 - Every remote-tracking branch becomes a real branch at the same commit.
-- Commits that the old layout only kept by accident are rescued as refs:
-  tips force-pushed away (still in the old reflogs) under
-  `refs/backup/<ts>-migration-reflog/`, and commits of branches an earlier
-  `--prune` deleted but not yet garbage collected under
-  `refs/backup/<ts>-migration-dangling/`.
+- Every commit or annotated tag that no ref points to any more - tips
+  force-pushed away that only the old reflogs remember, branches and re-cut
+  tags an earlier run deleted but git had not yet garbage collected - is
+  rescued as `refs/backup/<ts>-migration-unreferenced/<sha>`.
 - A clone that fails `git fsck` is left untouched and the repository is
-  reported as failed in `status.json`.
+  reported as failed in `status.json`; its issues, PRs and releases are still
+  backed up.
+- An old `--bare` mirror gets the same rescue of unreferenced commits and
+  tags once, when it is converted.
 - Each step is idempotent: an interrupted run (Ctrl-C, container killed)
   resumes the migration on the next run (`repository.mirror-migration/` is
   the in-progress state).
