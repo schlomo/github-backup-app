@@ -289,7 +289,7 @@ def test_missing_optional_remote_is_skipped(tmp_path, env):
     target = tmp_path / "wiki"
     assert gb.fetch_repository(
         "w", f"file://{tmp_path}/nope", str(target), env, optional=True
-    ) == (0, True)
+    ) == (0, True, None)
     assert not target.exists()
 
 
@@ -875,3 +875,126 @@ def test_git_failure_does_not_block_metadata_backup(loop, tmp_path, monkeypatch)
     assert calls == ["labels"]
     assert stats["repositories_failed"] == 1
     assert not (repo_cwd / gb.REPO_METADATA_FILENAME).exists()
+
+
+# --- Fresh copy as the fallback for broken local backups ----------------------
+
+
+def _quarantined(path):
+    parent, name = os.path.split(str(path))
+    return sorted(
+        os.path.join(parent, n)
+        for n in os.listdir(parent)
+        if n.startswith(name + gb.BROKEN_SUFFIX)
+    )
+
+
+def _corrupt_packs(git_dir):
+    git("-c", "gc.writeCommitGraph=false", "gc", "-q", cwd=git_dir)
+    for pack in (git_dir / "objects" / "pack").glob("*.pack"):
+        os.chmod(pack, 0o644)
+        pack.write_bytes(b"")
+
+
+def test_stale_commit_graph_does_not_block_migration(upstream, tmp_path):
+    """Seen in the field: 0.3.0's gc deleted unreferenced commits but left
+    them listed in the commit-graph cache, so fsck failed."""
+    legacy = tmp_path / "repository"
+    git("clone", "-q", f"file://{upstream}", str(legacy))
+    git("checkout", "-q", "-b", "gone", cwd=upstream)
+    commit(upstream, "later deleted")
+    git("checkout", "-q", "main", cwd=upstream)
+    git("fetch", "-q", "--all", "--prune", cwd=legacy)
+    git("commit-graph", "write", "--reachable", cwd=legacy)
+    git("branch", "-D", "gone", cwd=upstream)
+    git("fetch", "-q", "--all", "--prune", cwd=legacy)
+    git("reflog", "expire", "--expire-unreachable=now", "--all", cwd=legacy)
+    git("-c", "gc.writeCommitGraph=false", "gc", "-q", "--prune=now", cwd=legacy)
+    plain = subprocess.run(
+        ["git", "fsck", "--connectivity-only"], cwd=legacy, capture_output=True
+    )
+    assert plain.returncode != 0  # the situation from the field
+
+    gb.ensure_mirror_repository(str(legacy), f"file://{upstream}")
+
+    assert git("rev-parse", "--is-bare-repository", cwd=legacy) == "true"
+    assert _quarantined(legacy) == []
+
+
+def test_corrupt_legacy_clone_is_kept_and_replaced_by_fresh_copy(
+    upstream, legacy_clone, env
+):
+    legacy, _, _ = legacy_clone
+    _corrupt_packs(legacy / ".git")
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+
+    assert result.recovered and "fsck" in result.recovered["reason"]
+    moved = _quarantined(legacy)
+    assert moved == [result.recovered["moved_to"]]
+    assert os.path.isdir(os.path.join(moved[0], ".git"))  # old data kept as is
+    assert git("rev-parse", "--is-bare-repository", cwd=legacy) == "true"
+    want = {n: s for n, s in refs(upstream).items() if not n.endswith("/merge")}
+    assert refs(legacy) == want
+
+
+def test_unfinishable_migration_state_is_kept_and_replaced(upstream, legacy_clone, env):
+    legacy, _, _ = legacy_clone
+    os.mkdir(str(legacy) + gb.MIGRATION_SUFFIX)
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(legacy), env)
+
+    moved = result.recovered["moved_to"]
+    assert os.path.isdir(os.path.join(moved, ".git"))
+    assert os.path.isdir(moved + gb.MIGRATION_SUFFIX)
+    assert not os.path.exists(str(legacy) + gb.MIGRATION_SUFFIX)
+    assert refs(legacy)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
+
+
+def test_damaged_mirror_is_replaced_when_fetch_fails(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    _corrupt_packs(mirror)
+    commit(upstream, "new")
+
+    result = gb.fetch_repository("r", f"file://{upstream}", str(mirror), env)
+
+    assert result.recovered and "damaged" in result.recovered["reason"]
+    assert refs(mirror)["refs/heads/main"] == refs(upstream)["refs/heads/main"]
+
+
+def test_remote_failure_never_moves_a_backup_aside(upstream, tmp_path, env):
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    _corrupt_packs(mirror)  # even a damaged one: the remote is the problem
+    with pytest.raises(gb.GitCommandError):
+        gb.fetch_repository("r", f"file://{tmp_path}/gone", str(mirror), env)
+    assert _quarantined(mirror) == []
+    assert mirror.is_dir()
+
+
+def test_ownership_problem_never_moves_a_backup_aside(upstream, tmp_path, env):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to chown")
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    for root, dirs, files in os.walk(mirror):
+        for entry in [root, *(os.path.join(root, f) for f in files)]:
+            os.chown(entry, 12345, 12345)
+    with pytest.raises(gb.GitOwnershipError):
+        fetch(upstream, mirror, env)
+    assert _quarantined(mirror) == []
+
+
+def test_loop_reports_recovered_repository_as_success(loop, upstream, tmp_path):
+    repo_cwd = tmp_path / "out" / "o" / "repositories" / "r"
+    legacy = repo_cwd / "repository"
+    git("clone", "-q", f"file://{upstream}", str(legacy))
+    _corrupt_packs(legacy / ".git")
+
+    stats, _ = loop(f"file://{upstream}", _repository())
+
+    assert stats["repositories_succeeded"] == 1
+    [recovered] = stats["recovered_repositories"]
+    assert recovered["repository"] == "o/r"
+    assert os.path.isdir(recovered["moved_to"])

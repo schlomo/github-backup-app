@@ -2051,6 +2051,7 @@ def backup_repositories(args, output_directory, repositories):
     pulls_skipped = 0
     milestones_skipped = 0
     git_refs_archived = 0
+    recovered_repositories = []
     failed_repositories = []
     accounts = set()
     interrupted = False
@@ -2092,6 +2093,10 @@ def backup_repositories(args, output_directory, repositories):
                     )
                     git_refs_archived += result.archived
                     git_skipped += result.skipped
+                    if result.recovered:
+                        recovered_repositories.append(
+                            {"repository": repo_full_name, **result.recovered}
+                        )
                 except Exception as e:
                     logger.error(f"Git backup of {repo_full_name} failed: {e}")
                     git_errors.append(e)
@@ -2099,7 +2104,7 @@ def backup_repositories(args, output_directory, repositories):
             download_wiki = args.include_wiki or args.include_everything
             if repository["has_wiki"] and download_wiki:
                 try:
-                    git_refs_archived += fetch_repository(
+                    result = fetch_repository(
                         f"{repository['name']} wiki",
                         get_github_wiki_url(args, repository),
                         os.path.join(repo_cwd, "wiki"),
@@ -2108,7 +2113,12 @@ def backup_repositories(args, output_directory, repositories):
                         lfs_clone=args.lfs_clone,
                         optional=True,
                         force=args.force_full,
-                    ).archived
+                    )
+                    git_refs_archived += result.archived
+                    if result.recovered:
+                        recovered_repositories.append(
+                            {"repository": f"{repo_full_name} wiki", **result.recovered}
+                        )
                 except Exception as e:
                     logger.error(f"Wiki backup of {repo_full_name} failed: {e}")
                     git_errors.append(e)
@@ -2225,6 +2235,7 @@ def backup_repositories(args, output_directory, repositories):
         "pulls_skipped_unchanged": pulls_skipped,
         "milestones_skipped_unchanged": milestones_skipped,
         "git_refs_archived": git_refs_archived,
+        "recovered_repositories": recovered_repositories,
         "failed_repositories": failed_repositories,
         "interrupted": interrupted,
     }
@@ -2628,6 +2639,17 @@ class GitCommandError(Exception):
     pass
 
 
+class GitOwnershipError(GitCommandError):
+    """The backup is owned by another user. Never "repaired" by a fresh
+    clone: that would duplicate every repository after a wrong --user."""
+
+
+class BrokenBackupError(Exception):
+    """The local backup of a repository is unusable (failed integrity check,
+    unfinishable migration, not a git repository). fetch_repository moves it
+    aside, never deleting it, and clones a fresh copy."""
+
+
 def check_git_version():
     """Fail fast unless a git that supports everything we rely on is present."""
     try:
@@ -2710,7 +2732,7 @@ def _is_git_dir(path):
     result = _git(["rev-parse", "--absolute-git-dir"], cwd=path, check=False)
     if result.returncode != 0:
         if "dubious ownership" in result.stderr:
-            raise GitCommandError(
+            raise GitOwnershipError(
                 f"{path} is owned by a different user than the one running the "
                 "backup; run the backup as the owner of the backup directory "
                 f"(e.g. docker run --user). git: {result.stderr.strip()}"
@@ -2825,14 +2847,47 @@ def _settle_journal(git_dir, name):
     return archived
 
 
+# commit-graph is a pure cache. Old versions let `git gc` delete unreferenced
+# commits without rewriting it, so it can list commits that no longer exist,
+# which makes fsck fail although no data is missing.
+GIT_FSCK_OPTIONS = ("-c", "core.commitGraph=false")
+
+
+def _drop_commit_graph(git_dir):
+    """Remove the (regenerable) commit-graph cache of a repository."""
+    info = os.path.join(git_dir, "objects", "info")
+    graph = os.path.join(info, "commit-graph")
+    if os.path.exists(graph):
+        os.remove(graph)
+    if os.path.isdir(os.path.join(info, "commit-graphs")):
+        shutil.rmtree(os.path.join(info, "commit-graphs"))
+
+
+def _is_healthy(git_dir):
+    fsck = _git(
+        [*GIT_FSCK_OPTIONS, "fsck", "--connectivity-only", "--no-dangling"],
+        cwd=git_dir,
+        check=False,
+    )
+    return fsck.returncode == 0
+
+
 def _rescue_unreferenced(git_dir, label, what):
     """Archive commits and tags no ref points to any more (only reflogs or
     nothing), after checking repository integrity.
 
     Raises, without changing anything, if git fsck reports problems.
     """
+    _drop_commit_graph(git_dir)
     fsck = _git(
-        ["fsck", "--connectivity-only", "--no-reflogs", "--dangling", "--no-progress"],
+        [
+            *GIT_FSCK_OPTIONS,
+            "fsck",
+            "--connectivity-only",
+            "--no-reflogs",
+            "--dangling",
+            "--no-progress",
+        ],
         cwd=git_dir,
         check=False,
     )
@@ -2843,7 +2898,7 @@ def _rescue_unreferenced(git_dir, label, what):
             for line in fsck.stdout.splitlines()
             if not line.startswith("dangling ")
         ]
-        raise Exception(
+        raise BrokenBackupError(
             f"Not migrating {what}: git fsck reports problems (exit code "
             f"{fsck.returncode}), it was left untouched: "
             + "; ".join(line.strip() for line in problems if line.strip())[:1000]
@@ -2871,7 +2926,7 @@ def _migrate_working_clone_to_mirror(local_dir):
     tmp_dir = local_dir + MIGRATION_SUFFIX
     dot_git = os.path.join(local_dir, ".git")
     if os.path.isdir(dot_git) and os.path.exists(tmp_dir):
-        raise Exception(
+        raise BrokenBackupError(
             f"Cannot migrate {local_dir}: both {dot_git} and {tmp_dir} exist; "
             "left untouched, please resolve manually"
         )
@@ -2933,7 +2988,7 @@ def _migrate_working_clone_to_mirror(local_dir):
         if heads.get(f"refs/heads/{branch}", (None,))[0] != sha
     ]
     if missing or not _is_git_dir(tmp_dir):
-        raise Exception(
+        raise BrokenBackupError(
             f"Migration of {local_dir} could not be verified (missing branches: "
             f"{missing}); nothing was deleted, state kept in {tmp_dir}"
         )
@@ -2944,7 +2999,7 @@ def _migrate_working_clone_to_mirror(local_dir):
 
     if os.path.exists(local_dir):
         if os.path.exists(os.path.join(local_dir, ".git")):
-            raise Exception(f"Refusing to delete {local_dir}: it contains .git")
+            raise BrokenBackupError(f"Refusing to delete {local_dir}: it contains .git")
         # Only the checked-out working tree is left; its content is in git.
         shutil.rmtree(local_dir)
     os.rename(tmp_dir, local_dir)
@@ -3024,10 +3079,48 @@ def _parse_ls_remote(output):
     return default_ref, remote
 
 
-FetchResult = namedtuple("FetchResult", "archived skipped")
+FetchResult = namedtuple("FetchResult", "archived skipped recovered", defaults=(None,))
+BROKEN_SUFFIX = ".broken-"
 
 
-def fetch_repository(
+def _quarantine(local_dir):
+    """Move an unusable backup (and any half-done migration) aside. Never
+    deletes anything; returns the new location."""
+    dest = f"{local_dir}{BROKEN_SUFFIX}{_archive_timestamp()}"
+    base, n = dest, 0
+    while os.path.exists(dest) or os.path.exists(dest + MIGRATION_SUFFIX):
+        n += 1
+        dest = f"{base}-{n}"
+    if os.path.exists(local_dir):
+        os.rename(local_dir, dest)
+    if os.path.exists(local_dir + MIGRATION_SUFFIX):
+        os.rename(local_dir + MIGRATION_SUFFIX, dest + MIGRATION_SUFFIX)
+    return dest
+
+
+def fetch_repository(name, remote_url, local_dir, git_env, **kwargs):
+    """Create or update the bare mirror of one repository (see
+    _fetch_repository). If the local backup turns out to be unusable, it is
+    moved aside - never deleted - and a fresh copy is cloned; the returned
+    FetchResult then carries `recovered`.
+
+    Remote problems (network, authentication, GitHub) are never treated as
+    a broken backup: they are detected before the local backup is touched.
+    """
+    try:
+        return _fetch_repository(name, remote_url, local_dir, git_env, **kwargs)
+    except BrokenBackupError as e:
+        moved_to = _quarantine(local_dir)
+        logger.warning(
+            f"Backup of {name} in {local_dir} is unusable ({e}). Moved it to "
+            f"{moved_to} (kept for inspection, delete when no longer needed) "
+            "and cloning a fresh copy."
+        )
+        result = _fetch_repository(name, remote_url, local_dir, git_env, **kwargs)
+        return result._replace(recovered={"moved_to": moved_to, "reason": str(e)})
+
+
+def _fetch_repository(
     name,
     remote_url,
     local_dir,
@@ -3065,12 +3158,39 @@ def fetch_repository(
         )
     default_ref, remote_refs = _parse_ls_remote(listing.stdout)
 
+    try:
+        return _update_mirror(
+            name,
+            remote_url,
+            local_dir,
+            git_env,
+            default_ref,
+            remote_refs,
+            lfs_clone,
+            force,
+        )
+    except GitOwnershipError:
+        raise
+    except GitCommandError as e:
+        # GitHub answered ls-remote moments ago, so a git failure on an
+        # existing backup that also fails its integrity check is local.
+        has_git_backup = _is_git_dir(local_dir) or os.path.isdir(
+            os.path.join(local_dir, ".git")
+        )
+        if has_git_backup and not _is_healthy(local_dir):
+            raise BrokenBackupError(f"local backup is damaged: {e}") from e
+        raise
+
+
+def _update_mirror(
+    name, remote_url, local_dir, git_env, default_ref, remote_refs, lfs_clone, force
+):
     existed = ensure_mirror_repository(local_dir, remote_url)
     if existed:
         target = local_dir
     else:
         if os.path.exists(local_dir) and os.listdir(local_dir):
-            raise Exception(f"{local_dir} exists but is not a git repository")
+            raise BrokenBackupError(f"{local_dir} exists but is not a git repository")
         # Build a new mirror next to its final place and move it there only
         # once the first fetch succeeded, so a failed or killed first fetch
         # never leaves an empty "backup" behind.
@@ -3093,16 +3213,25 @@ def fetch_repository(
             f"{remote_url} in {local_dir}"
         )
         _write_journal(target, _list_mirrored_refs(target))
+        fetch_error = None
         try:
             _git(
                 [*GIT_NO_AUTO_GC, "fetch", "--quiet", "--force", "--prune", "origin"],
                 cwd=target,
                 env=git_env,
             )
-        finally:
-            # Also after a failed fetch: --prune deletes refs before
-            # transferring objects.
+        except GitCommandError as e:
+            fetch_error = e
+        # Also after a failed fetch: --prune deletes refs before transferring
+        # objects. (If the process is killed, the next run settles.)
+        try:
             archived += _settle_journal(target, name)
+        except Exception as settle_error:
+            if fetch_error is None:
+                raise
+            logger.error(f"Archiving refs of {name} failed: {settle_error}")
+        if fetch_error is not None:
+            raise fetch_error
 
     # Point HEAD at the remote default branch so a clone of the mirror checks
     # out the right branch (the default branch can change without a push).

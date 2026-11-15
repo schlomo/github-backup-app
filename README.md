@@ -261,6 +261,8 @@ always contains at least a `status` and a `finished_at` field:
     "issues_skipped_unchanged": 2223,
     "pulls_skipped_unchanged": 1661,
     "milestones_skipped_unchanged": 24,
+    "git_refs_archived": 3,
+    "recovered_repositories": [],
     "failed_repositories": []
   }
 }
@@ -313,6 +315,18 @@ whatever changed is archived after the fetch - successful or failed - or at
 the start of the next run. A first clone is built in `repository.new-mirror/`
 and only moved into place once it succeeded.
 
+**A fresh copy is the fallback for any broken backup.** If the local backup
+of a repository is unusable - it fails `git fsck`, a migration cannot be
+finished, the directory is not a git repository, or a git operation fails and
+the mirror is damaged - it is moved aside as `repository.broken-<timestamp>/`
+(never deleted) and a fresh copy is cloned from GitHub in the same run. The
+repository counts as backed up; `status.json` lists it under
+`recovered_repositories` with the reason and where the old copy went, and the
+log shows a warning. Inspect the old copy (its `refs/backup/*` archive is not
+carried over) and delete it when no longer needed. Problems on the GitHub side
+(network, authentication, outages) and ownership problems never trigger this:
+they fail the repository and leave the backup alone.
+
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
 process (requires git >= 2.31, checked at startup). It never appears in
@@ -350,9 +364,11 @@ no-op. The migration is designed to lose nothing:
   force-pushed away that only the old reflogs remember, branches and re-cut
   tags an earlier run deleted but git had not yet garbage collected - is
   rescued as `refs/backup/<ts>-migration-unreferenced/<sha>`.
-- A clone that fails `git fsck` is left untouched and the repository is
-  reported as failed in `status.json`; its issues, PRs and releases are still
-  backed up.
+- A clone that fails `git fsck` is not converted; it is moved aside and
+  replaced by a fresh copy (see "A fresh copy is the fallback" above). The
+  `commit-graph` cache file is dropped before the check: older runs could
+  leave it listing commits that git had already garbage collected, which
+  makes `fsck` fail although no data is missing.
 - An old `--bare` mirror gets the same rescue of unreferenced commits and
   tags once, when it is converted.
 - Each step is idempotent: an interrupted run (Ctrl-C, container killed)
@@ -362,7 +378,7 @@ no-op. The migration is designed to lose nothing:
 
 Recommended procedure: take a filesystem snapshot of the backup directory
 (e.g. Btrfs/ZFS snapshot on a NAS), run once, check `status.json` for
-`repositories_failed`, then verify with
+`repositories_failed` and `recovered_repositories`, then verify with
 `grep -rl ghs_ <backup-dir> --include=config` (expect no output). Do not roll
 back to 0.3.0 afterwards without its `--bare` flag: without it, 0.3.0 does not
 recognise the mirrors and silently stops backing up git content.
