@@ -50,3 +50,4 @@ id_rsa.pub
 # test content
 /creds
 /backup
+.claude/worktrees/
