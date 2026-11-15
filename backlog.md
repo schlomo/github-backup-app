@@ -50,9 +50,10 @@ to be its own PR that is tested and can be undone on its own.
 
 ## Test and release gaps
 
-- **Docker image is not built or smoke-tested on PRs**; CI builds it only on
-  `main` and tags, which also publishes `:latest`. Add a PR job that builds the
-  image and runs `github-backup --help` plus the git version check inside it.
+- **PR images accumulate in GHCR.** Pull requests now publish `:pr-<number>`
+  (with a `--help` smoke test and the build-time git version check). Add a
+  cleanup of PR tags after merge/close, e.g. a scheduled
+  `actions/delete-package-versions` job.
 - **`--lfs` has no automated test.** git-lfs with the auth header was verified
   by hand during review (git-lfs 3.4.1: header reaches the LFS API, is not
   sent to storage on another host). Add a test with a local LFS server or the
