@@ -3092,6 +3092,7 @@ def _configure_mirror(git_dir, remote_url):
     if "remote.origin.mirror" in current:
         # A `git clone --mirror` from the old --bare mode: rescue commits an
         # earlier --prune left unreferenced, then drop the mirror settings.
+        logger.info(f"Converting old --bare mirror {git_dir}")
         _rescue_unreferenced(
             git_dir, f"{_archive_timestamp()}-migration-unreferenced", git_dir
         )(git_dir)

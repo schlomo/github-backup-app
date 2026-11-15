@@ -566,13 +566,15 @@ def test_migration_leaves_corrupt_clone_untouched(upstream, legacy_clone):
     assert refs(legacy)["refs/remotes/origin/main"] == main
 
 
-def test_migration_of_old_bare_mirror(upstream, tmp_path, env):
+def test_migration_of_old_bare_mirror(upstream, tmp_path, env, caplog):
     old = tmp_path / "old"
     git("clone", "-q", "--mirror", f"file://{upstream}", str(old))
     git("config", "remote.origin.url", TOKEN_URL, cwd=old)
     assert "refs/pull/1/merge" in refs(old)
 
-    assert fetch(upstream, old, env) == 0
+    with caplog.at_level("INFO"):
+        assert fetch(upstream, old, env) == 0
+    assert any("Converting old --bare mirror" in r.getMessage() for r in caplog.records)
 
     assert "refs/pull/1/merge" not in refs(old)
     assert git("config", "--get-all", "remote.origin.fetch", cwd=old).split(
