@@ -159,6 +159,8 @@ def log_runtime_environment():
     freshly built container) is a common and hard-to-spot cause of failures, so
     we record it up front to make such problems obvious from the logs.
     """
+    # First line of every run, so a log or e-mail shows what produced it.
+    logger.info(f"github-backup-app {VERSION} - {PROJECT_URL}")
     jwt_version = getattr(jwt, "__version__", None) or _package_version("PyJWT")
     logger.debug(
         "Runtime: github-backup %s | Python %s | %s | "

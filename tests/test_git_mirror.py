@@ -1315,3 +1315,11 @@ def test_refs_under_archive_prefix_on_github_are_reported(
     assert "refs/backup/theirs" not in refs(mirror)
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("refs/backup/theirs" in w for w in warnings)
+
+
+def test_run_starts_with_version_banner(caplog):
+    with caplog.at_level("INFO"):
+        gb.log_runtime_environment()
+    first = caplog.records[0].getMessage()
+    assert first == f"github-backup-app {gb.VERSION} - {gb.PROJECT_URL}"
+    assert gb.VERSION == __import__("github_backup").__version__
