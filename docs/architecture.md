@@ -64,7 +64,7 @@ Moved from `backlog.md` at setup; they shape every change below.
 GitHub, trunk `main`, squash merges by the maintainer; architect docs
 go straight to `main` (D1). CI lints, tests and builds every PR and
 every push that changes a build input; such a push to `main` publishes
-the `:latest` image, docs-only pushes publish nothing, and a `v*` tag
+the `:latest` image, pushes that change no build input publish nothing, and a `v*` tag
 publishes PyPI. The sdist holds only the package, its tests, README and
 license (D2).
 Agents push branches, open draft PRs and undraft them once reviewed

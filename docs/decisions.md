@@ -57,10 +57,12 @@ architect's reading.
   confirmed by the maintainer.
 - **Decision:** every PR, and every branch push that changes a build
   input (the `paths` list in `ci-cd.yml`: package, tests, `pyproject.toml`,
-  `uv.lock`, README, license, Dockerfile, `.dockerignore`, workflows),
+  `uv.lock`, README, license, Dockerfile, `.dockerignore`, `.flake8`,
+  workflows),
   runs lint, tests and a package build; such a push to `main` publishes
   `ghcr.io/schlomo/github-backup-app` `:latest` and `:main`, while a
-  docs-only push (the architect's backlog) publishes nothing; a `v*` tag publishes to PyPI (trusted
+  push that changes no build input (the architect's backlog) publishes
+  nothing; a `v*` tag publishes to PyPI (trusted
   publishing, environment `pypi`) and the semver image tags; PRs from
   this repo push `:pr-<n>`. Only the maintainer registers pipelines
   and edits branch protection; workflow files change through PRs like
@@ -97,8 +99,8 @@ architect's reading.
   trying a change before merging.
 - **Decision:** one environment: the maintainer's NAS,
   which pulls the image from GHCR and is configured outside this repo.
-  No separate test installation.
-- **Consequences:** a broken `:latest` reaches that installation at its
+  No separate test environment.
+- **Consequences:** a broken `:latest` reaches the maintainer's NAS at its
   next run; its image reference is changed there, not here.
 - **Evidence:** setup session, 2026-11-16.
 

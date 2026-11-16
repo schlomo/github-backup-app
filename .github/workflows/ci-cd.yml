@@ -5,7 +5,8 @@ on:
     # Only build inputs trigger a branch push (and so a :latest publish on
     # main); docs-only pushes such as the architect's backlog do not. Tag
     # pushes ignore path filters, so releases always run. Pull requests stay
-    # unfiltered so their checks always report.
+    # unfiltered so their checks always report. Keep this list in step with
+    # the allowlist in .dockerignore.
     paths:
       - "github_backup/**"
       - "tests/**"
@@ -15,6 +16,7 @@ on:
       - "LICENSE.txt"
       - "Dockerfile"
       - ".dockerignore"
+      - ".flake8"
       - ".github/workflows/**"
   pull_request:
 

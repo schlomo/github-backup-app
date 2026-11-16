@@ -1,6 +1,6 @@
 # GitHub Backup App
 
-A modern Python application for backing up GitHub repositories and metadata using **GitHub App authentication**. It creates local backups of your git repositories, JSON metadata, and release assets — organized by account, ready to push elsewhere or restore from.
+A modern Python application for backing up GitHub repositories and metadata using **GitHub App authentication**. It creates local backups organized by account: git repositories as mirrors ready to push elsewhere or restore from, plus JSON metadata and release assets kept as a plain dump (there is no tool to restore those to GitHub).
 
 The intended workflow: create one public GitHub App (a private App can only be installed on the account that owns it), install it on every org and user account you want to back up, then run nightly, naming those accounts on the command line (see [GitHub App Setup](#github-app-setup)). The tool discovers all installations automatically and backs up every accessible repository.
 
@@ -502,8 +502,8 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 
 | Job | When it runs | What it does |
 |-----|--------------|--------------|
-| **test-build** | Every pull request, every branch push that changes a build input (the `paths` list in the workflow), every `v*` tag | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
-| **docker** | Push to `main`, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
+| **test-build** | Every pull request, every branch push that changes a build input (the `paths` list in the workflow), every tag push | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
+| **docker** | Push to `main` that changes a build input, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
 | **release** | Push of a `v*` tag only | Downloads the built wheel/sdist and publishes to PyPI via trusted publishing (GitHub environment `pypi`) |
 
 **Docker image tags** ([docker/metadata-action](https://github.com/docker/metadata-action)):

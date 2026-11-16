@@ -30,7 +30,9 @@ In this order:
    change the workflow and push any tag, including `:latest`. Move PR
    images to a separate package or gate them behind an approval; pin
    actions by commit SHA instead of tag; pin `uv`. Also make the test
-   job a required check on `main`: today a red PR can be merged.
+   job a required check on `main`: today a red PR can be merged. Branch
+   protection would also block the architect's direct pushes to `main`
+   unless the maintainer allows them to bypass it.
 3. **Agent-driven release minting.** The agent bumps the version and
    writes release notes from the merged PRs in a PR, then prepares a
    draft GitHub release; the maintainer publishes it, which tags `v*`

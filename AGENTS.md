@@ -246,8 +246,10 @@ flake8 and black clean.
 - **Merging code to `main` is a release of the container image.** A
   push to `main` that changes a build input (the `paths` list in
   `ci-cd.yml`) publishes `:latest`, which users pull unattended, so such
-  a merge request is a deploy request. A docs-only push, such as the
-  architect's backlog, publishes nothing.
+  a merge request is a deploy request. A push that changes no build
+  input, such as the architect's backlog, publishes nothing; a
+  `README.md` change does publish. A failed run on `main` stays failed
+  until someone re-runs it.
 - **A pushed branch with a PR publishes an image to the release
   package.** A PR from a branch in this repo pushes `:pr-<n>` with
   write access to `ghcr.io/schlomo/github-backup-app`, so a workflow
