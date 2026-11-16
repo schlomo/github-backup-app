@@ -1,23 +1,55 @@
 # Backlog
 
-Plan for turning `github-backup-app` into maintainable software, plus known
-gaps. Written alongside the 0.4.0 mirror rewrite; each numbered step is meant
-to be its own PR that is tested and can be undone on its own.
+Plan for `github-backup-app` and its known gaps. The guiding rules for
+every change live in [docs/architecture.md](docs/architecture.md)
+("Guiding principles"). Each numbered step is meant to be its own PR
+that is tested and can be undone on its own. Bug reports arrive as
+GitHub Issues and are triaged into this file.
 
-## Guiding rules
+## Next session starts here
 
-- **Correctness before speed.** A backup that silently misses data is worse
-  than a slow one. Every "skip" must be provably safe.
-- **One error model.** A repository either fully succeeds (and only then
-  writes `repo.json`) or is reported in `status.json` as failed. No step may
-  swallow an error and continue as if it had succeeded. Every defect found in
-  the 0.4.0 review was a violation of this rule.
-- **Refactors do not change behaviour.** Behaviour changes and structural
-  changes never share a PR.
-- **KISS.** Target about six modules of 300-600 lines each. No frameworks, no
-  plugin system, no abstraction without a second user.
+Setup is done (2026-11-16). Start with Queued item 1, the supersession
+research: its answer decides whether the rest is worth building.
 
-## Refactoring plan
+## In flight
+
+Nothing.
+
+## Queued
+
+In this order:
+
+1. **Is this project still needed?** Thorough research whether a
+   better-maintained tool now covers multi-account GitHub App backups
+   with incremental runs, git mirrors that never lose refs, and a
+   metadata dump. Outcome: continue, or a migration recommendation. Its
+   comparison also feeds the README cleanup (item 4).
+2. **PR images share the release package** (security; promoted from
+   the known limitations because agents now push branches).
+   Anyone who can push a branch to
+   this repository can change the workflow and push any tag, including
+   `:latest`. Move PR images to a separate package or gate them behind an
+   approval; pin actions by commit SHA instead of tag; pin `uv`.
+3. **Agent-driven release minting.** The agent bumps the version and
+   writes release notes from the merged PRs in a PR, then prepares a
+   draft GitHub release; the maintainer publishes it, which tags `v*`
+   and triggers PyPI. Replaces copy-pasting release text by hand.
+   Needs a design first.
+4. **Refactor**, the plan below, extended by:
+   - **Token injection seam:** the backup code takes a token and never
+     cares where it came from (App installation token, CI job token),
+     so the same code runs in production and in the live test.
+   - **Live backup test in CI** (allowed by D10): back up this
+     repository with the CI job's `GITHUB_TOKEN` against the real API
+     and assert the result. It does not cover the App's JWT-to-token
+     exchange; the dedicated test App idea under "Test and release
+     gaps" would. Whether it gates merges is decided in its design.
+   - **More exhaustive tests** beyond the characterization tests of
+     the refactoring plan's step 2.
+   - **README cleanup:** describe the tool in its own terms and shrink
+     the comparison with python-github-backup as the two diverge.
+
+### Refactoring plan
 
 1. **Extract the git layer unchanged** into `github_backup/git_mirror.py`
    (everything from `GIT_FETCH_REFSPECS` to `fetch_repository`, plus
@@ -48,7 +80,7 @@ to be its own PR that is tested and can be undone on its own.
 5. **Coverage gate in CI** (`pytest-cov`) for the new modules; keep the
    whole suite free of network access.
 
-## Test and release gaps
+### Test and release gaps
 
 - **PR images accumulate in GHCR.** Pull requests now publish `:pr-<number>`
   (with a `--help` smoke test and the build-time git version check). Add a
@@ -65,14 +97,10 @@ to be its own PR that is tested and can be undone on its own.
   changes unattended. Publish versioned image tags from releases and document
   pinning them.
 
-## Known limitations and follow-ups
+### Known limitations and follow-ups
 
 From the second adversarial review (not fixed in 0.4.0):
 
-- **PR images share the release package.** Anyone who can push a branch to
-  this repository can change the workflow and push any tag, including
-  `:latest`. Move PR images to a separate package or gate them behind an
-  approval; pin actions by commit SHA instead of tag; pin `uv`.
 - **First clones cannot resume.** A failed first clone is discarded
   (`repository.new-mirror/`) and starts over on the next run; a very large
   repository on a flaky connection may never finish.
@@ -82,11 +110,6 @@ From the second adversarial review (not fixed in 0.4.0):
   found", which GitHub also says for some permission problems.
 - **Tests that change file ownership need root** and are skipped on
   GitHub-hosted CI.
-
-- **Archive refs are kept forever.** `refs/backup/*` grows with every
-  deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
-  may be wanted eventually; it must never drop the only copy of a commit
-  silently.
 - **Duplicate archive refs** can appear if a run is killed while archiving
   (the journal is replayed under a new timestamp). Harmless, but noisy.
 - **Ownership is not auto-trusted.** A backup directory owned by a different
@@ -94,3 +117,21 @@ From the second adversarial review (not fixed in 0.4.0):
   `safe.directory`; deliberate, documented in the README.
 - **Feature gaps vs. python-github-backup:** gists, starred repositories,
   discussions, security advisories, user attachments.
+
+## Deliberately deferred
+
+- **Raising the Python minimum above 3.14.** Deferred: 3.14 is fine
+  (D5). Revisit when a dependency drops 3.14, a newer Python offers
+  something the code clearly benefits from, or 3.14 nears end of life
+  (October 2030); a session that notices one says so.
+- **Restoring metadata and release assets.** Deferred on purpose: they
+  are a dump kept for a possible exit from GitHub (D9). Revisit only
+  for an actual exit.
+- **Archive refs are kept forever.** `refs/backup/*` grows with every
+  deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
+  may be wanted eventually; it must never drop the only copy of a commit
+  silently.
+
+## Done (recent)
+
+- 2026-11-16: project setup recorded (`AGENTS.md`, `docs/`).

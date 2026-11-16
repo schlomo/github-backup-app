@@ -2,7 +2,7 @@
 
 A modern Python application for backing up GitHub repositories and metadata using **GitHub App authentication**. It creates local backups of your git repositories, JSON metadata, and release assets — organized by account, ready to push elsewhere or restore from.
 
-The intended workflow: create one private GitHub App, install it on every org and user account you want to back up, then run nightly. The tool discovers all installations automatically and backs up every accessible repository.
+The intended workflow: create one public GitHub App (a private App can only be installed on the account that owns it), install it on every org and user account you want to back up, then run nightly, naming those accounts on the command line (see [GitHub App Setup](#github-app-setup)). The tool discovers all installations automatically and backs up every accessible repository.
 
 This project is a fork of [python-backup](https://github.com/josegonzalez/python-github-backup) with a different focus: **multi-installation GitHub App backups**, **automatic incremental runs**, and **much faster repeat backups** on large estates.
 
@@ -148,15 +148,13 @@ Take note of the App ID and private key. You will need them to run a backup.
 #### Option B: Manual Creation
 
 1. Go to your GitHub organization settings `https://github.com/organizations/YOUR_ORG/settings/apps` or your user settings [https://github.com/settings/apps](https://github.com/settings/apps)
-2. Click "New GitHub App" and select "Private"
+2. Click "New GitHub App" and select "Public" to back up more than one account, or "Private" for only the account that owns the App (see the note under [GitHub App Setup](#github-app-setup))
 3. Configure permissions (see [GitHub App Setup](#github-app-setup) below) and click "Save"
 4. Note the App ID
 5. Generate and download the private key (PEM file)
 6. Install the app on your organization or user account
 
 Take note of the App ID and private key. You will need them to run a backup.
-
-For detailed automation instructions, see [scripts/README.md](scripts/README.md).
 
 ### 2. Dry Run (See What Would Be Backed Up)
 
@@ -538,6 +536,10 @@ publisher is configured on PyPI under the project's *Publishing* settings.
 ## License
 
 MIT License - see [LICENSE.txt](LICENSE.txt) for details.
+
+## Sponsor
+
+Sponsored by [Tektit Consulting](https://tektitconsulting.com).
 
 ## Acknowledgments
 
