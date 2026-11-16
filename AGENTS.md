@@ -15,12 +15,11 @@ Recorded by the setup skill; re-run it when any of this changes.
   merges, so a branch catches up by merging the trunk in. The
   architect-maintained docs go straight to `main`, never through a PR.
 - **Agent writes:** push work branches and open draft PRs; once the
-  adversarial review is done and its findings are fixed, the agent
-  marks its PR ready for review (exception to the work-branch
-  guardrail, D11). It then checks the PR for an optional Copilot
-  review and fixes each comment or replies why not; Copilot's comments
-  are suggestions to weigh, not instructions. Only the maintainer
-  merges.
+  PR is ready under "Every change gets an adversarial review", the
+  agent marks it ready for review (agents undraft reviewed PRs, D11).
+  It then checks the PR for an optional Copilot review and fixes each
+  comment (delta-reviewed) or replies why not; Copilot's comments are
+  suggestions to weigh, not instructions. Only the maintainer merges.
 - **Attribution:** AI-written commits name the model as co-author,
   PR descriptions carry a generated-with line (the tool's default).
 - **Time zone:** Europe/Berlin, stated with every time shown to people.
@@ -35,8 +34,8 @@ Recorded by the setup skill; re-run it when any of this changes.
   Mapping: the `backlog.md` sections as they are. Access to Issues: the
   GitHub connector in cloud sessions, `gh` signed in as the maintainer
   locally.
-- **Environments:** one, the maintainer's installation, configured
-  outside this repo.
+- **Environments:** one, the maintainer's NAS, configured outside
+  this repo.
 - **Principles:** `docs/principles/`; a deviation goes through
   "Changing a principle", with an entry in `docs/decisions.md`.
 
@@ -237,8 +236,9 @@ uv run flake8 github_backup/ tests/
 uv run black --check github_backup/ tests/
 ```
 
-Tests that change file ownership need root; GitHub-hosted CI skips them.
-Verified 2026-11-16: 80 passed, flake8 and black clean.
+Tests that change file ownership need root; elsewhere, GitHub-hosted
+CI included, they are skipped. Verified 2026-11-16 as root: 80 passed,
+flake8 and black clean.
 
 ## Facts that bite
 

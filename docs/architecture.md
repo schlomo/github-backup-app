@@ -24,8 +24,8 @@ another file owns:
 the one responsible for the code's and release chain's security: the
 maintainer, who is also the only known user. Legally affected: the
 people whose personal data sits in the backups; each operator is the
-controller for their own backups, and the maintainer speaks for their
-own installation (D6).
+controller for their own backups, and the maintainer speaks for the
+maintainer's NAS (D6).
 
 ## 1. Guiding principles
 
@@ -49,7 +49,7 @@ Moved from `backlog.md` at setup; they shape every change below.
   discovers every installation (filtered by positional account
   arguments), and per repository writes a git mirror, metadata JSON and
   release assets under `{output}/{owner}/repositories/{repo}/`, then a
-  run summary in `status.json`. Today one module of about 3,400 lines;
+  run summary in `status.json`. Today one module of about 3,500 lines;
   the split is queued in `backlog.md`.
 - **Helper `github-backup-create-app`**
   (`github_backup/create_github_app.py`): a local web page that creates
@@ -69,9 +69,12 @@ Agents push branches, open draft PRs and undraft them once reviewed
 
 ### Testing
 
-The offline suite gates every change and needs no credentials; a live
-backup test against GitHub in CI is the one allowed exception to the
-third-party rule (D10).
+The offline suite runs on every change and needs no network and no
+credentials. It gates publishing (the image and PyPI jobs wait for it);
+it does not yet block merging, since `main` has no required checks
+(queued in `backlog.md`). A live backup test against GitHub in CI is
+the one allowed exception to the third-party rule (D10), kept out of
+the offline suite.
 
 ### Work tracking
 
@@ -79,7 +82,7 @@ third-party rule (D10).
 
 ### Environments
 
-One: the maintainer's installation, configured outside this repo (D4).
+One: the maintainer's NAS, configured outside this repo (D4).
 
 ### Constraints
 

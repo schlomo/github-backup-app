@@ -24,12 +24,13 @@ In this order:
    with incremental runs, git mirrors that never lose refs, and a
    metadata dump. Outcome: continue, or a migration recommendation. Its
    comparison also feeds the README cleanup (item 4).
-2. **PR images share the release package** (security; promoted from
-   the known limitations because agents now push branches).
-   Anyone who can push a branch to
-   this repository can change the workflow and push any tag, including
-   `:latest`. Move PR images to a separate package or gate them behind an
-   approval; pin actions by commit SHA instead of tag; pin `uv`.
+2. **PR images share the release package** (security; from the second
+   adversarial review of 0.4.0, moved up because agents now push
+   branches). Anyone who can push a branch to this repository can
+   change the workflow and push any tag, including `:latest`. Move PR
+   images to a separate package or gate them behind an approval; pin
+   actions by commit SHA instead of tag; pin `uv`. Also make the test
+   job a required check on `main`: today a red PR can be merged.
 3. **Agent-driven release minting.** The agent bumps the version and
    writes release notes from the merged PRs in a PR, then prepares a
    draft GitHub release; the maintainer publishes it, which tags `v*`
@@ -47,7 +48,10 @@ In this order:
    - **More exhaustive tests** beyond the characterization tests of
      the refactoring plan's step 2.
    - **README cleanup:** describe the tool in its own terms and shrink
-     the comparison with python-github-backup as the two diverge.
+     the comparison with python-github-backup as the two diverge. The
+     create-app helper still offers "Private App" first and its "Next
+     Steps" run without an account filter; align it with the public-App
+     guidance.
 
 ### Refactoring plan
 
@@ -80,7 +84,9 @@ In this order:
 5. **Coverage gate in CI** (`pytest-cov`) for the new modules; keep the
    whole suite free of network access.
 
-### Test and release gaps
+## Test and release gaps (unordered)
+
+Known gaps, not yet ordered into Queued.
 
 - **PR images accumulate in GHCR.** Pull requests now publish `:pr-<number>`
   (with a `--help` smoke test and the build-time git version check). Add a
@@ -97,7 +103,9 @@ In this order:
   changes unattended. Publish versioned image tags from releases and document
   pinning them.
 
-### Known limitations and follow-ups
+## Known limitations and follow-ups (unordered)
+
+Some are deliberate (marked as such); none is ordered into Queued yet.
 
 From the second adversarial review (not fixed in 0.4.0):
 
@@ -110,6 +118,10 @@ From the second adversarial review (not fixed in 0.4.0):
   found", which GitHub also says for some permission problems.
 - **Tests that change file ownership need root** and are skipped on
   GitHub-hosted CI.
+- **Archive refs are kept forever.** `refs/backup/*` grows with every
+  deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
+  may be wanted eventually; it must never drop the only copy of a commit
+  silently.
 - **Duplicate archive refs** can appear if a run is killed while archiving
   (the journal is replayed under a new timestamp). Harmless, but noisy.
 - **Ownership is not auto-trusted.** A backup directory owned by a different
@@ -127,10 +139,6 @@ From the second adversarial review (not fixed in 0.4.0):
 - **Restoring metadata and release assets.** Deferred on purpose: they
   are a dump kept for a possible exit from GitHub (D9). Revisit only
   for an actual exit.
-- **Archive refs are kept forever.** `refs/backup/*` grows with every
-  deletion/force-push. Usually tiny, but a retention option (e.g. keep N days)
-  may be wanted eventually; it must never drop the only copy of a commit
-  silently.
 
 ## Done (recent)
 

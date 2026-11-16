@@ -49,8 +49,10 @@ so rather than silently picking a side.
   the brief set what an agent may write, and only a human merges.
   In this project (agents undraft reviewed PRs, D11), at the
   recommended level an agent also marks its own PR ready for review
-  once its adversarial review is done and the findings are fixed;
-  merging stays the human's.
+  once it is ready under "Every change gets an adversarial review"
+  (review done, fixes delta-reviewed, no BLOCKER or SHOULD-FIX open);
+  fixes from a later review, Copilot's included, are delta-reviewed
+  the same way. Merging stays the human's.
   Wherever these principles, the root instruction file, an agent
   definition or a brief say "push" or "the pushed remote", read it at
   the recorded level: below the recommended one, an agent stops at a

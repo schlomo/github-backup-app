@@ -30,17 +30,19 @@ run discovers all installations and backs up each one's repositories.
 ## Operator
 
 Whoever runs backups with their own GitHub App and storage; the
-controller for the personal data in their backups (D6).
+controller for the personal data in their backups (D6; the
+maintainer's reading, not legally reviewed).
 
-## Maintainer's installation
+## Maintainer's NAS
 
-The maintainer's own nightly run, configured outside this repo; the
-project's one environment (D4).
+The project's one environment (D4): the maintainer's own nightly
+backup, configured outside this repo.
 
 ## Mirror
 
 The bare git repository the tool keeps per backed-up repository, with
-all branches, tags and pull-request heads. The only part of a backup
+every ref GitHub advertises (branches, tags, pull-request heads) except
+pull-request merge refs. The only part of a backup
 that is restorable, by push (D9).
 
 ## Archive ref

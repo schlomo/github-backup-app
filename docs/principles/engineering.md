@@ -199,12 +199,13 @@ notice that passes, never a failure.
 briefly unreachable turns an external hiccup into your own outage.
 **How:** end-to-end reachability against a third party is a deliberate
 manual human step, not something a pipeline probes.
-**Exception in this project** (live GitHub backup test, D10): CI runs
-a real backup of this repository against GitHub's API with the CI
-job's own token. GitHub hosts the pipeline and is the system under
-test, so an outage stops both together; a red run caused by GitHub is
-rerun, not worked around. This test runs only in CI, never on a
-laptop; the offline suite stays credential-free.
+**Exception in this project** (live GitHub backup test, D10): a CI job
+may run a real backup of this repository against GitHub's API with the
+job's own token (queued, not built yet). GitHub hosts the pipeline and
+is the system under test; a red run caused by GitHub is rerun, not
+worked around. The test runs only in CI, never on a laptop, and stays
+out of the offline suite, which keeps needing no network and no
+credentials.
 
 ## Never-deployed things don't need migrations
 

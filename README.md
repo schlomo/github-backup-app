@@ -127,7 +127,7 @@ uv pip install https://github.com/schlomo/github-backup-app
 
 #### Option A: Automated Creation (Recommended)
 
-Use the provided automation script to create a GitHub App with the correct permissions:
+Use the provided automation script to create a GitHub App with the correct permissions. Choose *Public App* to back up more than one account (see the note under [GitHub App Setup](#github-app-setup)):
 
 ```bash
 source .venv/bin/activate
@@ -148,7 +148,7 @@ Take note of the App ID and private key. You will need them to run a backup.
 #### Option B: Manual Creation
 
 1. Go to your GitHub organization settings `https://github.com/organizations/YOUR_ORG/settings/apps` or your user settings [https://github.com/settings/apps](https://github.com/settings/apps)
-2. Click "New GitHub App" and select "Public" to back up more than one account, or "Private" for only the account that owns the App (see the note under [GitHub App Setup](#github-app-setup))
+2. Click "New GitHub App"; under "Where can this GitHub App be installed?" choose "Any account" (public) to back up more than one account, or "Only on this account" (private) for just the account that owns the App (see the note under [GitHub App Setup](#github-app-setup))
 3. Configure permissions (see [GitHub App Setup](#github-app-setup) below) and click "Save"
 4. Note the App ID
 5. Generate and download the private key (PEM file)
@@ -175,7 +175,8 @@ github-backup \
   --all \
   --output-directory ./backup
 
-# Backup specific users/organizations only (using positional arguments)
+# Backup specific users/organizations only (using positional arguments);
+# always do this with a public App, which anyone can install
 github-backup \
   --app-id YOUR_APP_ID \
   --private-key /path/to/your-app.pem \
