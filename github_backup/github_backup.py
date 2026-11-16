@@ -2623,14 +2623,24 @@ def backup_releases(
 # that `--prune` can never delete the archive refs, and so that GitHub's
 # synthetic `refs/pull/*/merge` commits (recomputed on every base-branch push)
 # are not backed up.
-GIT_FETCH_REFSPECS = (
-    "+refs/heads/*:refs/heads/*",
-    "+refs/tags/*:refs/tags/*",
-    "+refs/notes/*:refs/notes/*",
-    "+refs/pull/*/head:refs/pull/*/head",
-)
-MIRRORED_REF_NAMESPACES = ("refs/heads", "refs/tags", "refs/notes", "refs/pull")
 ARCHIVE_REF_PREFIX = "refs/backup"
+GIT_FETCH_REFSPECS = (
+    "+refs/*:refs/*",
+    # GitHub's synthetic merge commits, recomputed on every base-branch push.
+    "^refs/pull/*/merge",
+    # Keeps --prune away from the archive (refs GitHub does not have).
+    f"^{ARCHIVE_REF_PREFIX}/*",
+)
+
+
+def _is_mirrored_ref(ref):
+    """Every ref GitHub advertises is backed up, except the synthetic
+    refs/pull/<n>/merge and anything under the archive prefix."""
+    if not ref.startswith("refs/") or ref.startswith(ARCHIVE_REF_PREFIX + "/"):
+        return False
+    return not (ref.startswith("refs/pull/") and ref.endswith("/merge"))
+
+
 MIGRATION_SUFFIX = ".mirror-migration"
 NEW_MIRROR_SUFFIX = ".new-mirror"
 REF_JOURNAL = "backup-refs-journal"
@@ -2782,8 +2792,8 @@ def _list_refs(git_dir, *patterns):
 def _list_mirrored_refs(git_dir):
     return {
         name: value
-        for name, value in _list_refs(git_dir, *MIRRORED_REF_NAMESPACES).items()
-        if not name.startswith("refs/pull/") or name.endswith("/head")
+        for name, value in _list_refs(git_dir).items()
+        if _is_mirrored_ref(name)
     }
 
 
@@ -3171,11 +3181,11 @@ def _parse_ls_remote(output):
         sha, _, ref = line.partition("\t")
         if ref == "HEAD" or ref.endswith("^{}"):
             continue
-        if not ref.startswith(tuple(f"{ns}/" for ns in MIRRORED_REF_NAMESPACES)):
-            not_covered.append(ref)
-            continue
-        if ref.startswith("refs/pull/") and not ref.endswith("/head"):
+        if ref.startswith("refs/pull/") and ref.endswith("/merge"):
             continue  # GitHub's synthetic merge commits, deliberately skipped
+        if not _is_mirrored_ref(ref):
+            not_covered.append(ref)  # would collide with our archive
+            continue
         remote[ref] = sha
     return default_ref, remote, not_covered
 
@@ -3278,9 +3288,9 @@ def _fetch_repository(
     default_ref, remote_refs, not_covered = _parse_ls_remote(listing.stdout)
     if not_covered:
         logger.warning(
-            f"{name} has {len(not_covered)} ref(s) outside "
-            f"{', '.join(MIRRORED_REF_NAMESPACES)} that are not backed up, e.g. "
-            f"{', '.join(not_covered[:5])}"
+            f"{name} has {len(not_covered)} ref(s) under {ARCHIVE_REF_PREFIX}/ on "
+            "GitHub, which this backup uses for its own archive; they are not "
+            f"backed up, e.g. {', '.join(not_covered[:5])}"
         )
 
     try:

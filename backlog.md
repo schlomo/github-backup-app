@@ -76,10 +76,6 @@ From the second adversarial review (not fixed in 0.4.0):
 - **First clones cannot resume.** A failed first clone is discarded
   (`repository.new-mirror/`) and starts over on the next run; a very large
   repository on a flaky connection may never finish.
-- **Refs outside heads/tags/notes/pull** are not backed up (documented, and
-  logged as a warning per repository). If the warning shows up in practice:
-  fetching `+refs/*:refs/*` needs a way to keep `--prune` away from the
-  archive refs first.
 - **Case-insensitive filesystems** (some NAS/SMB mounts, macOS): refs that
   differ only in case make the fetch fail on every run (loudly).
 - **A wiki that was never backed up** is skipped when GitHub answers "not
