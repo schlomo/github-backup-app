@@ -295,13 +295,15 @@ Each repository (and wiki) is stored as a **bare mirror** under `repository/`
 |-----|---------|
 | `refs/heads/*` | every branch, exactly as on GitHub |
 | `refs/tags/*` | every tag |
-| `refs/notes/*` | git notes |
 | `refs/pull/<n>/head` | the head of every pull request, including PRs from forks whose commits exist nowhere else in the repository |
+| any other ref on GitHub | e.g. `refs/notes/*`, or `refs/remotes/*` and `refs/stash` left by a `git push --mirror` from a working copy, or namespaces of tools such as git-bug (`refs/bugs/*`) |
 | `refs/backup/<timestamp>/<ref>` | refs that GitHub **deleted or force-moved** since the previous run, preserved at their old commit |
 
-GitHub's synthetic `refs/pull/<n>/merge` commits are not backed up.
+Only GitHub's synthetic `refs/pull/<n>/merge` commits are not backed up. Refs
+that GitHub itself has under `refs/backup/` cannot be mirrored (that prefix
+holds the archive); the log warns if a repository has any.
 
-**Nothing is silently destroyed.** Every branch, PR head or note that
+**Nothing is silently destroyed.** Every branch, PR head or other ref that
 disappeared on GitHub or moved in a way that drops commits (force-push), and
 every tag that changed at all, is preserved as
 `refs/backup/<UTC timestamp>/<original ref>`. The mirror's `refs/heads` and
@@ -338,14 +340,6 @@ second run exits with code 3 and leaves `status.json` alone. Stalled transfers
 (below 1 KB/s for 10 minutes) are aborted, and git never follows HTTP
 redirects, so the token cannot be sent to another host.
 
-**Not backed up:** refs outside `refs/heads`, `refs/tags`, `refs/notes` and
-`refs/pull/*/head`. On GitHub these only exist when someone pushes them
-deliberately, e.g. `git push --mirror` from a working copy (which also pushes
-`refs/remotes/*` and `refs/stash`), or tools that keep data in their own
-namespace (git-bug: `refs/bugs/*`, Gerrit mirrors: `refs/changes/*`). The log
-warns for every repository that has such refs. Old `--bare` mirrors keep them
-from before the upgrade, but they are no longer updated.
-
 **No credentials on disk.** The GitHub App installation token is passed to git
 as an HTTP header through `GIT_CONFIG_*` environment variables of each git
 process (requires git >= 2.31, checked at startup). It never appears in
@@ -368,7 +362,9 @@ git -C backup/<owner>/repositories/<repo>/repository push <new-remote-url> \
   'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
 ```
 
-Do not use `git push --mirror`: GitHub rejects pushes to `refs/pull/*`. To look
+Other refs (e.g. `refs/notes/*`) can be pushed the same way. Do not use
+`git push --mirror`: GitHub rejects pushes to `refs/pull/*`, and it would
+also publish the `refs/backup/*` archive. To look
 at the code, `git clone backup/<owner>/repositories/<repo>/repository` gives a
 normal working copy. To recover archived history, list it with
 `git for-each-ref refs/backup` and push the ones you need as branches.

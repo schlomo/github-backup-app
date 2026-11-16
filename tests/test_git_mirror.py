@@ -1264,14 +1264,62 @@ def test_hooks_in_a_backup_never_run(upstream, tmp_path, env):
     assert not marker.exists()
 
 
-def test_refs_outside_the_mirrored_namespaces_are_reported(
+def test_all_refs_are_backed_up_except_synthetic_merge_refs(
     upstream, tmp_path, env, caplog
 ):
+    """E.g. `git push --mirror` from a working copy (refs/remotes/*) or
+    tools that keep data in their own namespace (git-bug)."""
     git("update-ref", "refs/bugs/1", "main", cwd=upstream)
-    git("update-ref", "refs/remotes/origin/main", "main", cwd=upstream)
+    git("update-ref", "refs/remotes/origin/1.7", "main", cwd=upstream)
+    git("update-ref", "refs/stash", "main", cwd=upstream)
     mirror = tmp_path / "mirror"
     with caplog.at_level("WARNING"):
         fetch(upstream, mirror, env)
+    got = refs(mirror)
+    for ref in ("refs/bugs/1", "refs/remotes/origin/1.7", "refs/stash"):
+        assert got[ref] == refs(upstream)[ref]
+    assert "refs/pull/1/merge" not in got
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # Unchanged custom refs do not defeat the skip ...
+    assert gb.fetch_repository("r", f"file://{upstream}", str(mirror), env).skipped
+    # ... and deleting one is archived like any branch.
+    git("update-ref", "-d", "refs/bugs/1", cwd=upstream)
+    assert fetch(upstream, mirror, env) == 1
+    assert any(n.endswith("/refs/bugs/1") for n in refs(mirror) if "backup" in n)
+
+
+def test_archive_survives_prune_with_catch_all_refspec(upstream, tmp_path, env):
+    """The fetch refspec is +refs/*:refs/*; without the negative refspec for
+    the archive, --prune would delete every archive ref."""
+    mirror = tmp_path / "mirror"
+    fetch(upstream, mirror, env)
+    git("branch", "-D", "hotfix", cwd=upstream)
+    fetch(upstream, mirror, env)
+    archive = {n for n in refs(mirror) if n.startswith("refs/backup/")}
+    assert archive
+    for i in range(2):
+        git("branch", f"tmp{i}", cwd=upstream)
+        fetch(upstream, mirror, env)
+        git("branch", "-D", f"tmp{i}", cwd=upstream)
+        fetch(upstream, mirror, env)
+    assert archive <= set(refs(mirror))
+
+
+def test_refs_under_archive_prefix_on_github_are_reported(
+    upstream, tmp_path, env, caplog
+):
+    git("update-ref", "refs/backup/theirs", "main", cwd=upstream)
+    mirror = tmp_path / "mirror"
+    with caplog.at_level("WARNING"):
+        fetch(upstream, mirror, env)
+    assert "refs/backup/theirs" not in refs(mirror)
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("2 ref(s)" in w and "refs/bugs/1" in w for w in warnings)
-    assert not any("refs/pull/1/merge" in w for w in warnings)
+    assert any("refs/backup/theirs" in w for w in warnings)
+
+
+def test_run_starts_with_version_banner(caplog):
+    with caplog.at_level("INFO"):
+        gb.log_runtime_environment()
+    first = caplog.records[0].getMessage()
+    assert first == f"github-backup-app {gb.VERSION} - {gb.PROJECT_URL}"
+    assert gb.VERSION == __import__("github_backup").__version__
