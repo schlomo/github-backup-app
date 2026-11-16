@@ -1,10 +1,10 @@
 # AGENTS.md
 
-github-backup-app backs up the GitHub repositories, metadata and
-release assets of every account a GitHub App is installed on (a public
-App, to cover several accounts), as local files ready to push elsewhere
-or restore from. It runs nightly, for people who keep their own copy
-outside GitHub.
+github-backup-app backs up every GitHub account a GitHub App is
+installed on (a public App, to cover several accounts) as local files:
+git mirrors ready to push elsewhere or restore from, plus metadata and
+release assets kept as a dump. It runs nightly, for people who keep
+their own copy outside GitHub.
 
 ## Project setup
 
@@ -25,7 +25,8 @@ Recorded by the setup skill; re-run it when any of this changes.
 - **Time zone:** Europe/Berlin, stated with every time shown to people.
   Tool schedules (Dependabot, cron) are UTC unless they set a zone.
 - **Pipeline:** `.github/workflows/ci-cd.yml` lints, tests and builds
-  on every push and PR; merging to `main` publishes the container image
+  on every PR and on every branch push that changes a build input (its
+  `paths` list); such a push to `main` publishes the container image
   `ghcr.io/schlomo/github-backup-app:latest` and `:main`; a `v*` tag
   publishes to PyPI and the semver image tags. Who may register
   pipelines and edit branch policies: the maintainer only.
@@ -242,9 +243,11 @@ flake8 and black clean.
 
 ## Facts that bite
 
-- **Merging to `main` is a release of the container image.** It
-  publishes `:latest`, which users pull unattended, so a merge request
-  is a deploy request.
+- **Merging code to `main` is a release of the container image.** A
+  push to `main` that changes a build input (the `paths` list in
+  `ci-cd.yml`) publishes `:latest`, which users pull unattended, so such
+  a merge request is a deploy request. A docs-only push, such as the
+  architect's backlog, publishes nothing.
 - **A pushed branch with a PR publishes an image to the release
   package.** A PR from a branch in this repo pushes `:pr-<n>` with
   write access to `ghcr.io/schlomo/github-backup-app`, so a workflow

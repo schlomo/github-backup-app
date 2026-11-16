@@ -2,6 +2,20 @@ name: CI/CD
 
 on:
   push:
+    # Only build inputs trigger a branch push (and so a :latest publish on
+    # main); docs-only pushes such as the architect's backlog do not. Tag
+    # pushes ignore path filters, so releases always run. Pull requests stay
+    # unfiltered so their checks always report.
+    paths:
+      - "github_backup/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "LICENSE.txt"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/**"
   pull_request:
 
 env:

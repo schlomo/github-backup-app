@@ -502,19 +502,19 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 
 | Job | When it runs | What it does |
 |-----|--------------|--------------|
-| **test-build** | Every push and pull request | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
+| **test-build** | Every pull request, every branch push that changes a build input (the `paths` list in the workflow), every `v*` tag | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
 | **docker** | Push to `main`, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
 | **release** | Push of a `v*` tag only | Downloads the built wheel/sdist and publishes to PyPI via trusted publishing (GitHub environment `pypi`) |
 
 **Docker image tags** ([docker/metadata-action](https://github.com/docker/metadata-action)):
 
-- **`latest`** — every push to `main` (what the Quick Start uses)
+- **`latest`** — every push to `main` that changes the code or build (what the Quick Start uses)
 - **`main`** — branch ref tag on `main` pushes
 - **`X.Y.Z`**, **`X.Y`**, **`X`** — when you push an annotated semver tag like `v0.2.0`
 - **`pr-<number>`** — every push to a pull request from this repository, to try a
   change before merging (e.g. `ghcr.io/schlomo/github-backup-app:pr-12`)
 
-Merging to `main` updates `ghcr.io/schlomo/github-backup-app:latest`. No git tag is required for Docker.
+Merging a code change to `main` updates `ghcr.io/schlomo/github-backup-app:latest`; pushes that only touch docs (for example `backlog.md` or `docs/`) skip CI. No git tag is required for Docker.
 
 **Releases and PyPI** — the PyPI job only runs for a **version tag** (`v0.4.1`, not `0.4.1`):
 

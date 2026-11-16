@@ -41,6 +41,7 @@ dev = [
     "tqdm>=4.68.3",
     "twine>=7.0.0",
     "pytest>=9.2.0",
+    "hatchling>=1.33.0",
 ]
 
 [project.scripts]
@@ -54,6 +55,9 @@ Issues = "https://github.com/schlomo/github-backup-app/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["github_backup"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/github_backup", "/tests", "/README.md", "/LICENSE.txt"]
 
 [tool.hatch.version]
 path = "github_backup/__init__.py"

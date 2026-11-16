@@ -55,16 +55,25 @@ architect's reading.
 - **Status:** in force
 - **Context:** recorded at setup from `.github/workflows/ci-cd.yml`,
   confirmed by the maintainer.
-- **Decision:** every push and PR runs lint, tests and a package build;
-  merging to `main` publishes `ghcr.io/schlomo/github-backup-app`
-  `:latest` and `:main`; a `v*` tag publishes to PyPI (trusted
+- **Decision:** every PR, and every branch push that changes a build
+  input (the `paths` list in `ci-cd.yml`: package, tests, `pyproject.toml`,
+  `uv.lock`, README, license, Dockerfile, `.dockerignore`, workflows),
+  runs lint, tests and a package build; such a push to `main` publishes
+  `ghcr.io/schlomo/github-backup-app` `:latest` and `:main`, while a
+  docs-only push (the architect's backlog) publishes nothing; a `v*` tag publishes to PyPI (trusted
   publishing, environment `pypi`) and the semver image tags; PRs from
   this repo push `:pr-<n>`. Only the maintainer registers pipelines
   and edits branch protection; workflow files change through PRs like
   any other file (Dependabot updates actions).
-- **Consequences:** every merge is a release of the image; a merge
-  request is a deploy request.
-- **Evidence:** `.github/workflows/ci-cd.yml`.
+  The sdist holds only `github_backup/`, `tests/`, README, license and
+  the metadata hatchling adds (`tests/test_packaging.py`).
+- **Consequences:** every merge that changes code is a release of the
+  image; such a merge request is a deploy request. The maintainer chose
+  "limit the build to code changes" so architect pushes to `main` do
+  not republish `:latest`; pull requests stay unfiltered, because a
+  check skipped by a path filter stays pending and would block a
+  required check.
+- **Evidence:** `.github/workflows/ci-cd.yml`, `pyproject.toml`.
 
 ## D3: Work tracked in `backlog.md`, Issues for bug reports (2026-11-16)
 
@@ -93,16 +102,17 @@ architect's reading.
   next run; its image reference is changed there, not here.
 - **Evidence:** setup session, 2026-11-16.
 
-## D5: €0 budget, MIT license, Python 3.14 minimum (2026-11-16)
+## D5: MIT license, Python 3.14 minimum (2026-11-16)
 
 - **Status:** in force
 - **Context:** the maintainer's answer at setup: no other
   organizational rules.
-- **Decision:** free tiers only; the MIT license stays (the project is
+- **Decision:** the MIT license stays (the project is
   derived from python-github-backup); `requires-python >= 3.14`.
   Raising the Python minimum is deferred in `backlog.md` with its
   triggers.
-- **Consequences:** any paid service needs a new decision.
+- **Consequences:** budget is the maintainer's own concern and is
+  deliberately not recorded here.
 - **Evidence:** `pyproject.toml`, `LICENSE.txt`.
 
 ## D6: Each operator is responsible for the personal data in their backups (2026-11-16)

@@ -1,10 +1,10 @@
 # github-backup-app — architecture (current state)
 
-github-backup-app backs up the GitHub repositories, metadata and
-release assets of every account a GitHub App is installed on (a public
-App, to cover several accounts), as local files ready to push elsewhere
-or restore from. It runs nightly, for people who keep their own copy
-outside GitHub. It works when every run ends with a clean `status.json`
+github-backup-app backs up every GitHub account a GitHub App is
+installed on (a public App, to cover several accounts) as local files:
+git mirrors ready to push elsewhere or restore from, plus metadata and
+release assets kept as a dump. It runs nightly, for people who keep
+their own copy outside GitHub. It works when every run ends with a clean `status.json`
 and the git mirrors restore by push (D9).
 
 Everything here is current and settled. Nothing here restates what
@@ -20,9 +20,9 @@ another file owns:
 | Known failures, keyed by their exact error text | [troubleshooting.md](troubleshooting.md) |
 | Work in flight, queued, deliberately deferred | [../backlog.md](../backlog.md) |
 
-**Stakeholders:** users, operators, the one paying (free tiers, D5) and
-the one responsible for the code's and release chain's security: the
-maintainer, who is also the only known user. Legally affected: the
+**Stakeholders:** users, operators, and the one responsible for the
+code's and release chain's security: the maintainer, who is also the
+only known user and the one paying. Legally affected: the
 people whose personal data sits in the backups; each operator is the
 controller for their own backups, and the maintainer speaks for the
 maintainer's NAS (D6).
@@ -62,8 +62,11 @@ Moved from `backlog.md` at setup; they shape every change below.
 ### Delivery
 
 GitHub, trunk `main`, squash merges by the maintainer; architect docs
-go straight to `main` (D1). CI lints, tests and builds every change;
-merging publishes the `:latest` image, a `v*` tag publishes PyPI (D2).
+go straight to `main` (D1). CI lints, tests and builds every PR and
+every push that changes a build input; such a push to `main` publishes
+the `:latest` image, docs-only pushes publish nothing, and a `v*` tag
+publishes PyPI. The sdist holds only the package, its tests, README and
+license (D2).
 Agents push branches, open draft PRs and undraft them once reviewed
 (D7, D11). Attribution is the tool's default (D8).
 
@@ -86,7 +89,7 @@ One: the maintainer's NAS, configured outside this repo (D4).
 
 ### Constraints
 
-€0, MIT, Python 3.14 minimum (D5). Personal data in backups is each
+MIT, Python 3.14 minimum (D5). Personal data in backups is each
 operator's responsibility (D6). Only git mirrors are restorable;
 metadata and release assets are a deliberate dump (D9).
 
