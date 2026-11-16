@@ -100,7 +100,14 @@ docker run --rm -it \
 
 ## Installation
 
-NOTE: Publication on PyPI is not planned, please use the Docker image instead or run your own build & delivery to where you need the package.
+The Docker image is the primary way to run it. The package is also on
+[PyPI](https://pypi.org/p/github-backup-app) (requires Python 3.14 and git >= 2.31):
+
+```bash
+uv tool install github-backup-app
+# or
+pipx install github-backup-app
+```
 
 ### Manual Installation with uv from GitHub
 
@@ -496,9 +503,9 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 
 | Job | When it runs | What it does |
 |-----|--------------|--------------|
-| **test-build** | Every push and pull request | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` → uploads `dist/` artifact |
+| **test-build** | Every push and pull request | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
 | **docker** | Push to `main`, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
-| **release** | Push of a `v*` tag only | Downloads the built wheel/sdist and publishes to PyPI |
+| **release** | Push of a `v*` tag only | Downloads the built wheel/sdist and publishes to PyPI via trusted publishing (GitHub environment `pypi`) |
 
 **Docker image tags** ([docker/metadata-action](https://github.com/docker/metadata-action)):
 
@@ -510,18 +517,17 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 
 Merging to `main` updates `ghcr.io/schlomo/github-backup-app:latest`. No git tag is required for Docker.
 
-**PyPI and version tags** — the PyPI job only runs when you push a **version tag** (`v0.2.0`, not `0.2.0`):
+**Releases and PyPI** — the PyPI job only runs for a **version tag** (`v0.4.1`, not `0.4.1`):
 
-1. Bump version in [`github_backup/__init__.py`](github_backup/__init__.py)
-2. Merge to `main` (updates `:latest` Docker image)
-3. Tag and push:
+1. Bump the version in [`github_backup/__init__.py`](github_backup/__init__.py)
+2. Merge to `main` (updates the `:latest` Docker image)
+3. Publish a GitHub release with a new tag `vX.Y.Z` on `main` (or push the tag)
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-That triggers semver Docker tags and PyPI publish (requires a `PYPI_API_TOKEN` repository secret). There are no GitHub Releases in the repo yet; production Docker images come from `main` branch builds.
+That triggers the semver Docker tags and the PyPI upload. PyPI uses
+[trusted publishing](https://docs.pypi.org/trusted-publishers/): GitHub's
+short-lived OIDC token is accepted for this repository, the workflow
+`ci-cd.yml` and the environment `pypi`; there is no API token secret. The
+publisher is configured on PyPI under the project's *Publishing* settings.
 
 ## Requirements
 
