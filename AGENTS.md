@@ -238,7 +238,7 @@ uv run black --check github_backup/ tests/
 ```
 
 Tests that change file ownership need root; elsewhere, GitHub-hosted
-CI included, they are skipped. Verified 2026-11-16 as root: 80 passed,
+CI included, they are skipped. Verified 2026-11-16 as root: 82 passed,
 flake8 and black clean.
 
 ## Facts that bite
