@@ -1,8 +1,8 @@
 # GitHub Backup App
 
-A modern Python application for backing up GitHub repositories and metadata using **GitHub App authentication**. It creates local backups of your git repositories, JSON metadata, and release assets — organized by account, ready to push elsewhere or restore from.
+A modern Python application for backing up GitHub repositories and metadata using **GitHub App authentication**. It creates local backups organized by account: git repositories as mirrors ready to push elsewhere or restore from, plus JSON metadata and release assets kept as a plain dump (there is no tool to restore those to GitHub).
 
-The intended workflow: create one private GitHub App, install it on every org and user account you want to back up, then run nightly. The tool discovers all installations automatically and backs up every accessible repository.
+The intended workflow: create one public GitHub App (a private App can only be installed on the account that owns it), install it on every org and user account you want to back up, then run nightly, naming those accounts on the command line (see [GitHub App Setup](#github-app-setup)). The tool discovers all installations automatically and backs up every accessible repository.
 
 This project is a fork of [python-backup](https://github.com/josegonzalez/python-github-backup) with a different focus: **multi-installation GitHub App backups**, **automatic incremental runs**, and **much faster repeat backups** on large estates.
 
@@ -127,7 +127,7 @@ uv pip install https://github.com/schlomo/github-backup-app
 
 #### Option A: Automated Creation (Recommended)
 
-Use the provided automation script to create a GitHub App with the correct permissions:
+Use the provided automation script to create a GitHub App with the correct permissions. Choose *Public App* to back up more than one account (see the note under [GitHub App Setup](#github-app-setup)):
 
 ```bash
 source .venv/bin/activate
@@ -148,15 +148,13 @@ Take note of the App ID and private key. You will need them to run a backup.
 #### Option B: Manual Creation
 
 1. Go to your GitHub organization settings `https://github.com/organizations/YOUR_ORG/settings/apps` or your user settings [https://github.com/settings/apps](https://github.com/settings/apps)
-2. Click "New GitHub App" and select "Private"
+2. Click "New GitHub App"; under "Where can this GitHub App be installed?" choose "Any account" (public) to back up more than one account, or "Only on this account" (private) for just the account that owns the App (see the note under [GitHub App Setup](#github-app-setup))
 3. Configure permissions (see [GitHub App Setup](#github-app-setup) below) and click "Save"
 4. Note the App ID
 5. Generate and download the private key (PEM file)
 6. Install the app on your organization or user account
 
 Take note of the App ID and private key. You will need them to run a backup.
-
-For detailed automation instructions, see [scripts/README.md](scripts/README.md).
 
 ### 2. Dry Run (See What Would Be Backed Up)
 
@@ -177,7 +175,8 @@ github-backup \
   --all \
   --output-directory ./backup
 
-# Backup specific users/organizations only (using positional arguments)
+# Backup specific users/organizations only (using positional arguments);
+# always do this with a public App, which anyone can install
 github-backup \
   --app-id YOUR_APP_ID \
   --private-key /path/to/your-app.pem \
@@ -503,19 +502,19 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 
 | Job | When it runs | What it does |
 |-----|--------------|--------------|
-| **test-build** | Every push and pull request | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
-| **docker** | Push to `main`, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
+| **test-build** | Every pull request, every branch push that changes a build input (the `paths` list in the workflow), every tag push | Lint (flake8), format check (black), tests (pytest), import/CLI smoke test, `uv build` + `twine check` → uploads `dist/` artifact |
+| **docker** | Push to `main` that changes a build input, push of a `v*` tag, **or** a pull request | Builds multi-arch (`amd64` + `arm64`) image, pushes to `ghcr.io/schlomo/github-backup-app` and runs `--help` in it (pull requests from forks: build only) |
 | **release** | Push of a `v*` tag only | Downloads the built wheel/sdist and publishes to PyPI via trusted publishing (GitHub environment `pypi`) |
 
 **Docker image tags** ([docker/metadata-action](https://github.com/docker/metadata-action)):
 
-- **`latest`** — every push to `main` (what the Quick Start uses)
+- **`latest`** — every push to `main` that changes the code or build (what the Quick Start uses)
 - **`main`** — branch ref tag on `main` pushes
 - **`X.Y.Z`**, **`X.Y`**, **`X`** — when you push an annotated semver tag like `v0.2.0`
 - **`pr-<number>`** — every push to a pull request from this repository, to try a
   change before merging (e.g. `ghcr.io/schlomo/github-backup-app:pr-12`)
 
-Merging to `main` updates `ghcr.io/schlomo/github-backup-app:latest`. No git tag is required for Docker.
+Merging a code change to `main` updates `ghcr.io/schlomo/github-backup-app:latest`; pushes that only touch docs (for example `backlog.md` or `docs/`) skip CI; `README.md` is a build input and does not. No git tag is required for Docker.
 
 **Releases and PyPI** — the PyPI job only runs for a **version tag** (`v0.4.1`, not `0.4.1`):
 
@@ -538,6 +537,10 @@ publisher is configured on PyPI under the project's *Publishing* settings.
 ## License
 
 MIT License - see [LICENSE.txt](LICENSE.txt) for details.
+
+## Sponsor
+
+Sponsored by [Tektit Consulting](https://tektitconsulting.com).
 
 ## Acknowledgments
 
