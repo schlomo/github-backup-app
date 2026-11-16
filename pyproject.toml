@@ -39,7 +39,7 @@ dev = [
     "keyring>=25.7.0",
     "pkginfo>=1.12.1.2",
     "tqdm>=4.68.3",
-    "twine>=6.2.0",
+    "twine>=7.0.0",
     "pytest>=9.2.0",
 ]
 
