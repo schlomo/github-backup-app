@@ -1,6 +1,6 @@
-# Allowlist of the image's build inputs. Keep it in step with the push
-# `paths` list in .github/workflows/ci-cd.yml, or a change here will not
-# republish :latest.
+# Allowlist of the image's build inputs. Every entry here must also be in
+# the push `paths` list in .github/workflows/ci-cd.yml, or changes to it
+# will not republish :latest.
 *
 !github_backup/
 !pyproject.toml

@@ -3,10 +3,11 @@ name: CI/CD
 on:
   push:
     # Only build inputs trigger a branch push (and so a :latest publish on
-    # main); docs-only pushes such as the architect's backlog do not. Tag
+    # main); pushes that touch no listed path, such as the architect's
+    # backlog, do not. Tag
     # pushes ignore path filters, so releases always run. Pull requests stay
-    # unfiltered so their checks always report. Keep this list in step with
-    # the allowlist in .dockerignore.
+    # unfiltered so their checks always report. Every .dockerignore allowlist
+    # entry must be listed here.
     paths:
       - "github_backup/**"
       - "tests/**"

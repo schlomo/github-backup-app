@@ -514,7 +514,7 @@ CI/CD is defined in [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
 - **`pr-<number>`** — every push to a pull request from this repository, to try a
   change before merging (e.g. `ghcr.io/schlomo/github-backup-app:pr-12`)
 
-Merging a code change to `main` updates `ghcr.io/schlomo/github-backup-app:latest`; pushes that only touch docs (for example `backlog.md` or `docs/`) skip CI. No git tag is required for Docker.
+Merging a code change to `main` updates `ghcr.io/schlomo/github-backup-app:latest`; pushes that only touch docs (for example `backlog.md` or `docs/`) skip CI; `README.md` is a build input and does not. No git tag is required for Docker.
 
 **Releases and PyPI** — the PyPI job only runs for a **version tag** (`v0.4.1`, not `0.4.1`):
 
